@@ -14,7 +14,7 @@ BBox = Tuple[int, int, int, int]
 
 @dataclass
 class DetectionConfig:
-    model_path: str = "D:\\Sem6_Subjects\\Capstone\\implementation\\models\\yolo11x.pt"
+    model_path: str = "E:\\Capstone\\implementation\\models\\yolo11x.pt"
     conf_threshold: float = 0.25
     iou_threshold: float = 0.45
     track_buffer: int = 50

@@ -119,7 +119,7 @@ class RecognitionResult:
 
 @dataclass
 class WorkerConfig:
-    plate_model_path: str   = "D:\\Sem6_Subjects\\Capstone\\implementation\\models\\license_plate_detector.pt"
+    plate_model_path: str   = "E:\\Capstone\\implementation\\models\\license_plate_detector.pt"
     plate_conf:       float = 0.25
     plate_padding:    int   = 6
     use_gpu:          bool  = True

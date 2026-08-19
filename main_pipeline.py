@@ -33,9 +33,9 @@ logger = logging.getLogger(__name__)
 
 RUN_ID       = datetime.now().strftime("%Y%m%d_%H%M%S")
 OUTPUT_DIR   = os.path.join("output", RUN_ID)
-VIDEO_SOURCE = "D:\\Sem6_Subjects\\Capstone\\implementation\\traffic.mp4"
-MODEL_VEHICLE = "D:\\Sem6_Subjects\\Capstone\\implementation\\models\\yolo26s.pt"
-MODEL_PLATE   = "D:\\Sem6_Subjects\\Capstone\\implementation\\models\\license_plate_detector.pt"
+VIDEO_SOURCE = "E:\\Capstone\\dataset\\test2.mp4"
+MODEL_VEHICLE = "E:\\Capstone\\implementation\\models\\yolo26s.pt"
+MODEL_PLATE   = "E:\\Capstone\\implementation\\models\\license_plate_detector.pt"
 
 RICH_CSV_PATH = os.path.join(OUTPUT_DIR, "results_rich.csv")
 DB_PATH       = os.path.join(OUTPUT_DIR, "results.db")

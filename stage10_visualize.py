@@ -24,10 +24,10 @@ def draw_border(img, top_left, bottom_right, color=(0, 255, 0), thickness=10, li
     return img
 
 
-results = pd.read_csv(r"D:\Sem6_Subjects\Capstone\implementation\Automatic-License-Plate-Recognition-using-YOLOv8-main\test.csv")
+results = pd.read_csv(r"E:\Capstone\implementation\Automatic-License-Plate-Recognition-using-YOLOv8-main\test.csv")
 
 # load video
-video_path = r"D:\Sem6_Subjects\Capstone\implementation\traffic.mp4"
+video_path = r"E:\Capstone\implementation\traffic.mp4"
 cap = cv2.VideoCapture(video_path)
 
 fourcc = cv2.VideoWriter_fourcc(*'mp4v')  # Specify the codec
