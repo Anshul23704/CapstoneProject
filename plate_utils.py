@@ -214,7 +214,7 @@ def enhance_plate_crop_bilateral(
         plate_crop = cv2.resize(
             plate_crop,
             (max(1, int(w * scale)), max(1, int(h * scale))),
-            interpolation=cv2.INTER_CUBIC,
+            interpolation=cv2.INTER_LANCZOS4,
         )
 
     gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
@@ -223,6 +223,19 @@ def enhance_plate_crop_bilateral(
     filtered = cv2.bilateralFilter(gray, d=11, sigmaColor=17, sigmaSpace=17)
 
     return cv2.cvtColor(filtered, cv2.COLOR_GRAY2BGR)
+
+
+def plate_edge_density(plate_crop: np.ndarray) -> float:
+    """
+    Computes the proportion of Canny edge pixels in the plate crop.
+    Empty bumpers/smooth plastic have near-zero edge density (< 0.02),
+    whereas real license plates with characters have edge density > 0.035.
+    """
+    if plate_crop is None or plate_crop.size == 0:
+        return 0.0
+    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY) if plate_crop.ndim == 3 else plate_crop
+    edges = cv2.Canny(gray, 50, 150)
+    return float(np.count_nonzero(edges) / max(1, edges.size))
 
 
 # ── Geometry ───────────────────────────────────────────────────────────────────

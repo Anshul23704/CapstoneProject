@@ -59,7 +59,16 @@ class JobCreationStage:
         # rather than being silently dropped).
         def _rank_key(f: FrameEntry):
             has_plate = f.plate_bbox is not None
-            return (has_plate, f.plate_conf if has_plate else 0.0, self._sharpness(f.crop))
+            if has_plate and f.plate_bbox is not None:
+                pw = max(1, f.plate_bbox[2] - f.plate_bbox[0])
+                ph = max(1, f.plate_bbox[3] - f.plate_bbox[1])
+                plate_area = float(pw * ph)
+            else:
+                plate_area = 1.0
+            sharpness = self._sharpness(f.crop)
+            # Rank by plate presence first, then combined resolution (plate area) & sharpness score
+            score = (np.sqrt(plate_area) * sharpness * (f.plate_conf if has_plate else 0.5))
+            return (has_plate, score)
 
         scored = sorted(fv.frames, key=_rank_key, reverse=True)
 

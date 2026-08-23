@@ -207,7 +207,7 @@ def run() -> None:
     consumer_thread.start()
 
     ingestion = FrameIngestionStage(
-        FrameIngestionConfig(source=config.VIDEO_SOURCE, target_resolution=(1280, 720))
+        FrameIngestionConfig(source=config.VIDEO_SOURCE, target_resolution=None)
     )
 
     finalized_count = 0

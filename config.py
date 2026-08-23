@@ -66,13 +66,13 @@ DETECTION_CONF_THRESHOLD = 0.25
 DETECTION_IOU_THRESHOLD  = 0.45
 MAX_FRAME_SIZE            = 1920   # resize cap before detection (GPU memory)
 
-TRACK_BUFFER            = 50
-TRACK_MATCH_THRESHOLD   = 0.60
+TRACK_BUFFER            = 90     # 90 frames (~3.0s at 30fps) persistence buffer
+TRACK_MATCH_THRESHOLD   = 0.45   # relaxed threshold to maintain tracks during fast motion / pan
 
 # ── Buffering (Stage 3) ───────────────────────────────────────────────────────
 # Unlimited buffering: a vehicle keeps all its frames until it leaves the scene.
 BUFFER_MAX_SIZE          = None   # None = keep all frames (no sliding window pop)
-BUFFER_TIMEOUT_FRAMES    = 30     # frames-since-seen before timeout finalize
+BUFFER_TIMEOUT_FRAMES    = 90     # synchronized with TRACK_BUFFER (90 frames)
 BUFFER_FORCE_FINALIZE_AT = None   # None = do not force finalize; let vehicle track complete naturally
 ROI_PAD                  = 80     # px padding around vehicle bbox for the stored ROI
 
@@ -108,12 +108,13 @@ BLUR_THRESHOLD  = 80.0   # Laplacian variance below this = too blurry/occluded
 # track happens afterward in Stage 3, in full-frame coordinates only — no
 # ROI offsets anywhere, which removes the entire class of coordinate bugs
 # the last two tuning passes were fighting.
-PLATE_CONF_THRESHOLD = 0.25
-# Ingestion frames are 1280x720 (see FrameIngestionConfig.target_resolution
-# in main_pipeline.py). imgsz=1280 covers that natively with no shrink;
-# round up to the nearest 32 as ultralytics expects.
-PLATE_DETECT_IMGSZ  = 1280
-MIN_PLATE_AREA       = 80   # small/distant plates are legitimately this small at 1280x720
+PLATE_CONF_THRESHOLD = 0.30
+# Ingestion frames run at native resolution (target_resolution=None).
+# imgsz=1280 or 1920 covers native resolution cleanly.
+PLATE_DETECT_IMGSZ   = 1280
+MIN_PLATE_AREA        = 80   # px^2
+MIN_PLATE_ASPECT_RATIO = 1.10  # allows 2-line square plates (~1.1-1.3) while rejecting extreme square/vertical artifacts
+MAX_PLATE_ASPECT_RATIO = 5.5   # filters out overly wide trim strips
 
 PLATE_PADDING        = 10   # px padding added around the matched plate box before crop/enhance
 PLATE_UPSCALE_FACTOR = 2.0

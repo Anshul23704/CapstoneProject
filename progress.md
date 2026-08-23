@@ -123,23 +123,78 @@ Baseline Run (0 Plates) ──► Teammate Merge ──► Run 1 (319 Cars / 2 P
 
 ---
 
+### [Phase 5] Resolution Restoration & False-Positive Hardening (All 4 Fixes Implemented)
+
+#### Issues Diagnosed from Visual Crop Audit:
+1. **Low Pixel Resolution & Blurry Plates:** Stage 1's downscaling to $1280 \times 720$ shrank plate bounding boxes by $>50\%$, rendering small font characters illegible.
+2. **False Positives (QR Codes & Square Stickers):** Low plate detector confidence ($0.25$) triggered on auto-rickshaw ads and square QR codes.
+3. **Empty / Hallucinated Bounding Boxes:** Smooth bumper recesses without text were marked as plates.
+
+#### Implemented Changes (User Requested):
+1. **Native Video Resolution Ingestion (Fix 1):**
+   * Modified `main_pipeline.py` to `target_resolution=None` in `FrameIngestionConfig`. Frames stream at full native source resolution ($1080\text{p}/4\text{K}$), instantly multiplying character pixel density $2\times\text{–}3\times$.
+2. **Plate Confidence & Aspect Ratio Filtering (Fix 2):**
+   * In `config.py` and `plate_detection.py`, raised `PLATE_CONF_THRESHOLD` to `0.40`.
+   * Enforced geometric bounds `MIN_PLATE_ASPECT_RATIO = 1.3` and `MAX_PLATE_ASPECT_RATIO = 5.5`, automatically rejecting square QR codes ($w/h \approx 1.0$), tall vertical stickers, and extreme horizontal trim.
+3. **Resolution & Sharpness Aware Frame Selection (Fix 3):**
+   * In `stage5_job_creation.py`, modified ranking formula to $\text{Score} = \sqrt{\text{Plate Bounding Box Area}} \times \text{Sharpness} \times \text{Confidence}$. OCR workers now prioritize frames where the car is closest and plate resolution is maximal.
+4. **Canny Edge Density Verification & Lanczos4 Upscaling (Fix 4):**
+   * In `plate_utils.py` and `stage6_worker_pool.py`, implemented `plate_edge_density(plate_crop)` ($<0.02 \rightarrow \text{drop empty bodywork}$).
+   * Upgraded plate upscaling interpolation from Bicubic to `cv2.INTER_LANCZOS4` for sharper text stroke edges.
+
+---
+
+### [Phase 6] Coordinate Realignment, 2-Line Plate OCR Merging & 90-Frame Tracker Persistence (`20260823_130547`)
+
+#### Implemented Changes:
+1. **Stage 2 Coordinate Inverse Scaling:**
+   * Updated `DetectionTrackingStage` in `stage2_detection_tracking.py` to map $1920\text{p}$-downscaled bounding boxes back to the native input frame coordinate space ($2592 \times 1944$) using inverse scaling (`rx = int(round(x * inv_scale))`).
+   * Bounding boxes passed to Stage 3 now align with Stage 2.5 full-frame plate detections ($1.00\text{ IoA}$).
+2. **Two-Line Indian Plate EasyOCR Merging:**
+   * Updated `_run_ocr_validated()` in `stage6_worker_pool.py` to sort vertically stacked EasyOCR text boxes, filter out `IND` hologram badges, and concatenate top/bottom lines (e.g. `KA01` + `AB1234` $\rightarrow$ `KA01AB1234`).
+3. **90-Frame Longevity & Match Relaxation:**
+   * Increased `TRACK_BUFFER = 90` frames (~3 seconds at 30 fps) and synchronized `BUFFER_TIMEOUT_FRAMES = 90` in `config.py`.
+   * Relaxed `TRACK_MATCH_THRESHOLD = 0.45` to maintain track continuity across fast motion and camera panning.
+4. **Plate Detector Aspect Ratio & Threshold Tuning:**
+   * Lowered `MIN_PLATE_ASPECT_RATIO = 1.10` to admit square/stacked 2-line plates.
+   * Adjusted `PLATE_CONF_THRESHOLD = 0.30`.
+
+#### Run Results Comparison:
+| Metric | Baseline | Run 1 (104434) | Run 2 (112933) | Run 3 (122935) | **Phase 6 Run (130547)** | Result |
+| :--- | :--- | :--- | :--- | :--- | :--- | :--- |
+| **Total Finalized Vehicles** | 0 | 319 | 178 | 148 | **136** | Clean tracking, reduced noise |
+| **Raw Plate Bounding Boxes** | 0 | Handful | 739 | 52 (bugged) | **759** | Complete full-frame localization |
+| **Fused Plates (SUCCESS)** | 0 | 2 | 10 | 1 (bugged) | **33** | **3.3x increase over previous best** |
+| **Unique Plate Strings** | 0 | 2 | 10 | 1 | **29** | High diversity across vehicles |
+| **Interpolated CSV Rows** | 0 | 12 | 58 | 15 | **1,113 rows** | Smooth multi-frame trajectory |
+
+#### Sample Plate Readings in Phase 6:
+* Track 896/906/886: **`AP39JL3969`** (Conf: 0.9810 across multiple readings)
+* Track 629/699: **`KA53AC6692`** (Conf: 0.5514 across 20 readings)
+* Track 20/543: **`KA25HE8870`** (Conf: 0.4549 across 13 readings)
+* Track 4/3: **`KA01MP4882`** / **`KA01HP4882`** (Conf: 0.4467 across 13 readings)
+* Track 830: **`KA04OS1206`** (Conf: 0.2263 across 16 readings)
+* Track 847: **`KA01MN1413`** (Conf: 0.3814)
+
+---
+
 ## 3. Comprehensive Stage Audit & Current File Map
 
 | File Path | Primary Responsibility | Key Recent Edits |
 | :--- | :--- | :--- |
-| `config.py` | Centralized paths, thresholds, devices | `VEHICLE_CLASS_IDS={2}`, `BUFFER_FORCE_FINALIZE_AT=None` |
-| `plate_utils.py` | Positional heuristics, geometry, filters | Added `enhance_plate_crop_bilateral`, `soft_format_indian_plate`, expanded confusion maps |
-| `stage2_detection_tracking.py` | Vehicle detection & ByteTrack | Filters by `VEHICLE_CLASS_IDS` |
-| `plate_detection.py` | Stage 2.5 full-frame plate detector | YOLOv8 plate inference at $1280 \times 720$ |
-| `stage3_active_buffering.py` | Trajectory buffer & IoA association | Unlimited buffer mode, IoA matching |
+| `config.py` | Centralized paths, thresholds, devices | `PLATE_CONF_THRESHOLD=0.30`, `MIN_ASPECT_RATIO=1.10`, `TRACK_BUFFER=90`, `BUFFER_TIMEOUT=90`, `TRACK_MATCH=0.45` |
+| `plate_utils.py` | Positional heuristics, geometry, filters | `plate_edge_density`, `INTER_LANCZOS4`, `enhance_plate_crop_bilateral`, `soft_format_indian_plate` |
+| `stage2_detection_tracking.py` | Vehicle detection & ByteTrack | Inverse coordinate scaling (`orig_w, orig_h`), `VEHICLE_CLASS_IDS={2}` |
+| `plate_detection.py` | Stage 2.5 full-frame plate detector | Aspect ratio filtering $[1.10, 5.5]$, native frame processing |
+| `stage3_active_buffering.py` | Trajectory buffer & IoA association | 90-frame timeout synchronization, IoA matching |
 | `stage4_vehicle_finalization.py` | Quality checks & track closure | Drops short tracks ($<3$ frames) |
-| `stage5_job_creation.py` | Frame selection for OCR workers | Sharpness sorting, top-$k$ frame selection |
-| `stage6_worker_pool.py` | Image enhancement, OCR, crop export | Saves plate/context crops, bilateral filtering, soft correction |
+| `stage5_job_creation.py` | Frame selection for OCR workers | Combined $\text{Area} \times \text{Sharpness}$ ranking |
+| `stage6_worker_pool.py` | Image enhancement, OCR, crop export | 2-line vertically stacked EasyOCR merging, `IND` hologram filtering, crop export |
 | `stage7_temporal_fusion.py` | Multi-frame character voting | Modal length alignment, voting without hard rejection |
 | `stage8_database_analytics.py` | SQLite DB logging & summary plots | Logs `ocr_results` with tracking metadata |
 | `stage9_interpolation.py` | Bounding box smoothing | Interpolates validated vehicle detections |
 | `stage10_visualize.py` | Annotated video creation | Renders bounding boxes from `results_raw_detections.csv` |
-| `main_pipeline.py` | Threading orchestrator & CSV writer | Wires `plate_crops/` export, deferred strict validation |
+| `main_pipeline.py` | Threading orchestrator & CSV writer | Native resolution (`target_resolution=None`), raw detection streaming |
 
 ---
 
@@ -163,3 +218,4 @@ These are recommended optimizations that can be selectively enabled in future it
 
 ### Suggested Change 4: Fine-Tuned License Plate OCR (TrOCR / CRNN)
 * **Concept:** Replace or augment EasyOCR with a compact CRNN or Microsoft TrOCR fine-tuned specifically on Indian vehicle plate fonts (FE-Schrift / Mandated IND font).
+

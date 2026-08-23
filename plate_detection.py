@@ -53,11 +53,13 @@ class PlateDetection:
 
 @dataclass
 class PlateDetectionConfig:
-    model_path:     str   = config.PLATE_MODEL_PATH
-    conf_threshold: float = config.PLATE_CONF_THRESHOLD
-    device:         str   = config.DEVICE
-    imgsz:          int   = config.PLATE_DETECT_IMGSZ
-    min_plate_area: int   = config.MIN_PLATE_AREA
+    model_path:        str   = config.PLATE_MODEL_PATH
+    conf_threshold:    float = config.PLATE_CONF_THRESHOLD
+    device:            str   = config.DEVICE
+    imgsz:             int   = config.PLATE_DETECT_IMGSZ
+    min_plate_area:    int   = config.MIN_PLATE_AREA
+    min_aspect_ratio:  float = config.MIN_PLATE_ASPECT_RATIO
+    max_aspect_ratio:  float = config.MAX_PLATE_ASPECT_RATIO
 
 
 class PlateDetectionStage:
@@ -99,9 +101,17 @@ class PlateDetectionStage:
         for i in range(len(results.boxes)):
             x1, y1, x2, y2 = map(int, results.boxes.xyxy[i])
             conf = float(results.boxes.conf[i])
-            area = max(1, (x2 - x1) * (y2 - y1))
+            w = max(1, x2 - x1)
+            h = max(1, y2 - y1)
+            area = w * h
             if area < self.cfg.min_plate_area:
                 continue
+
+            aspect_ratio = w / float(h)
+            if not (self.cfg.min_aspect_ratio <= aspect_ratio <= self.cfg.max_aspect_ratio):
+                # Rejects square QR codes (~1.0), tall vertical ads (<1.0), or ultra-wide strips
+                continue
+
             detections.append(PlateDetection(bbox=(x1, y1, x2, y2), conf=conf))
 
         return detections

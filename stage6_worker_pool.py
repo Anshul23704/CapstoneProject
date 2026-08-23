@@ -49,6 +49,7 @@ from plate_utils import (
     license_complies_format,
     format_license,
     soft_format_indian_plate,
+    plate_edge_density,
 )
 
 logger = logging.getLogger(__name__)
@@ -225,6 +226,11 @@ class Worker(threading.Thread):
                 DIAG.bump("crop_empty")
                 continue
 
+            # Empty bumper / smooth surface filter: real plates have character strokes (edges)
+            if plate_edge_density(plate_crop) < 0.02:
+                DIAG.bump("crop_empty")
+                continue
+
             # Commenting out old enhancement method as requested
             # plate_ready = enhance_plate_crop(plate_crop, upscale_factor=self.cfg.upscale_factor)
             plate_ready = enhance_plate_crop_bilateral(plate_crop, upscale_factor=self.cfg.upscale_factor)
@@ -323,14 +329,12 @@ class Worker(threading.Thread):
 
     def _run_ocr_validated(self, plate_img: np.ndarray, tag: str = "") -> Tuple[str, float]:
         """
-        Iterates every EasyOCR detection, applies OCR-confusion correction
-        (format_license), and returns the best candidate. Correct first,
-        then return the first ALREADY-valid corrected candidate immediately;
-        if none of this frame's detections corrects to a fully valid plate,
-        still forward the highest-confidence length-plausible candidate
-        (8-10 chars) so it can contribute to Stage 7 fusion. Only true noise
-        (too short/too long to plausibly be a plate) is dropped here — final
-        validity is enforced on the FUSED result by Stage 7, not per-frame.
+        Iterates EasyOCR detections and supports:
+        1. Single-line plate candidate extraction and correction.
+        2. Multi-line / vertically stacked candidate merging (e.g., 2-line Indian plates
+           where the state/RTO code is on top and series/registration number is below).
+        3. Automatic stripping of accidental 'IND' country identifier holograms.
+        4. Soft positional heuristic formatting for Indian vehicle layout.
         """
         detections = self.ocr.readtext(
             plate_img,
@@ -350,18 +354,52 @@ class Worker(threading.Thread):
 
         plausible: List[Tuple[str, float]] = []
         raw_seen: List[str] = []
+
+        # 1. Single detection candidates
         for (_bbox, text, conf) in detections:
             clean = clean_ocr_text(text)
             if not clean:
                 continue
 
-            # Soft positional correction: replaces characters based on Indian plate
-            # layout heuristics without ever discarding or rejecting the string.
+            # Strip leading 'IND' if accidentally included in a long string (e.g. INDKA01AB1234)
+            if clean.startswith("IND") and len(clean) > 10:
+                clean = clean[3:]
+
             corrected = soft_format_indian_plate(clean)
             raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
 
             if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
                 plausible.append((corrected, float(conf)))
+
+        # 2. Multi-line / vertically stacked detection merging (for 2-line plates)
+        if len(detections) >= 2:
+            # Sort boxes vertically from top to bottom
+            sorted_dets = sorted(detections, key=lambda d: min(p[1] for p in d[0]))
+            clean_parts = []
+            confs = []
+            for (_bbox, text, conf) in sorted_dets:
+                c = clean_ocr_text(text)
+                if not c:
+                    continue
+                # Ignore isolated 'IND' country stamp
+                if c == "IND":
+                    continue
+                if c.startswith("IND") and len(c) > 4:
+                    c = c[3:]
+                clean_parts.append(c)
+                confs.append(float(conf))
+
+            if len(clean_parts) >= 2:
+                merged_text = "".join(clean_parts)
+                if merged_text.startswith("IND") and len(merged_text) > 10:
+                    merged_text = merged_text[3:]
+
+                corrected_merged = soft_format_indian_plate(merged_text)
+                merged_conf = float(sum(confs) / len(confs)) if confs else 0.0
+                raw_seen.append(f"stacked[{'+'.join(clean_parts)}]->'{corrected_merged}'(conf={merged_conf:.2f})")
+
+                if self._MIN_PLATE_LEN <= len(corrected_merged) <= self._MAX_PLATE_LEN:
+                    plausible.append((corrected_merged, merged_conf))
 
         if plausible:
             DIAG.bump("ocr_forwarded_plausible")
