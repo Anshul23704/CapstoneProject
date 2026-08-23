@@ -1,11 +1,13 @@
 from __future__ import annotations
 import logging
-from dataclasses import dataclass
-from typing import Dict, Optional, Tuple
+from dataclasses import dataclass, field
+from typing import Dict, Optional, Set, Tuple
 import numpy as np
 import cv2
 from ultralytics import YOLO
 import supervision as sv
+
+import config
 
 logger = logging.getLogger(__name__)
 
@@ -14,16 +16,29 @@ BBox = Tuple[int, int, int, int]
 
 @dataclass
 class DetectionConfig:
-    model_path: str = "E:\\Capstone\\implementation\\models\\yolo11x.pt"
-    conf_threshold: float = 0.25
-    iou_threshold: float = 0.45
-    track_buffer: int = 50
-    match_threshold: float = 0.60
-    device: str = "cuda"
-    max_frame_size: int = 1920
+    model_path: str = config.VEHICLE_MODEL_PATH
+    conf_threshold: float = config.DETECTION_CONF_THRESHOLD
+    iou_threshold: float = config.DETECTION_IOU_THRESHOLD
+    track_buffer: int = config.TRACK_BUFFER
+    match_threshold: float = config.TRACK_MATCH_THRESHOLD
+    device: str = config.DEVICE
+    max_frame_size: int = config.MAX_FRAME_SIZE
+    # FIX: this used to be hardcoded to {2, 5, 7} inside _detect() while
+    # main_pipeline.py independently hardcoded {2, 3, 7} (including
+    # motorcycles) — the two silently disagreed on what counts as a
+    # "vehicle". Both now read from config.VEHICLE_CLASS_IDS.
+    vehicle_class_ids: Set[int] = field(default_factory=lambda: set(config.VEHICLE_CLASS_IDS))
 
 
 class DetectionTrackingStage:
+    """
+    Stage 2 — Detection & Tracking (main GPU thread).
+
+    Per the architecture diagram (Slide 9), this is the ONLY stage that runs
+    on the main thread's GPU path during real-time ingestion. Plate detection
+    and OCR happen later, asynchronously, in Stage 6's worker threads — this
+    stage must stay cheap per-frame.
+    """
 
     def __init__(self, config: DetectionConfig) -> None:
         self.cfg = config
@@ -48,7 +63,6 @@ class DetectionTrackingStage:
 
         tracked = self._tracker.update_with_detections(raw_detections)
 
-        # Moved to debug logging – remove the noisy per-frame print
         logger.debug("Tracker IDs: %s", tracked.tracker_id)
 
         return self._to_dict(tracked)
@@ -81,12 +95,7 @@ class DetectionTrackingStage:
 
             detections = sv.Detections.from_ultralytics(results)
 
-            # Keep only vehicles: car(2), bus(5), truck(7)
-            mask = (
-                (detections.class_id == 2)
-                | (detections.class_id == 5)
-                | (detections.class_id == 7)
-            )
+            mask = np.isin(detections.class_id, list(self.cfg.vehicle_class_ids))
             detections = detections[mask]
             return detections
 

@@ -1,5 +1,3 @@
-
-
 from __future__ import annotations
 
 import argparse
@@ -51,13 +49,11 @@ def interpolate_csv(src_path: str) -> str:
         dst.write_text("")
         return str(dst)
 
-    # Check required columns
     cols = set(data[0].keys())
     required = {"frame_nmr", "car_id", "car_bbox", "license_plate_bbox"}
     missing  = required - cols
     if missing:
         logger.warning("interpolate_csv: missing columns %s — cannot interpolate", missing)
-        # Just copy source to dst
         with open(dst, "w", newline="", encoding="utf-8") as f:
             writer = csv.DictWriter(f, fieldnames=list(cols))
             writer.writeheader()
@@ -73,12 +69,17 @@ def interpolate_csv(src_path: str) -> str:
     unique_car_ids = np.unique(car_ids)
 
     for car_id in unique_car_ids:
-        # All frame numbers that actually appear for this car
-        frame_numbers_ = [
-            p["frame_nmr"]
+        # FIX: this set is now int-typed. Previously it stored the raw CSV
+        # string values and was checked via `str(fn) in frame_numbers_`,
+        # which is fragile to any formatting difference (e.g. a stray
+        # leading/trailing space in the source CSV would silently break the
+        # membership test and mark every row as "interpolated" with score 0
+        # even for frames that had a real reading).
+        real_frame_numbers = {
+            int(p["frame_nmr"])
             for p in data
             if int(float(p["car_id"])) == int(float(car_id))
-        ]
+        }
 
         car_mask              = car_ids == car_id
         car_frame_numbers     = frame_numbers[car_mask]
@@ -89,7 +90,6 @@ def interpolate_csv(src_path: str) -> str:
         plate_bboxes_interp = []
 
         first_frame = car_frame_numbers[0]
-        last_frame  = car_frame_numbers[-1]
 
         for i in range(len(car_bboxes_t)):
             frame_number      = car_frame_numbers[i]
@@ -120,7 +120,7 @@ def interpolate_csv(src_path: str) -> str:
             plate_bboxes_interp.append(plate_bbox)
 
         for i, (cb, pb) in enumerate(zip(car_bboxes_interp, plate_bboxes_interp)):
-            fn = first_frame + i
+            fn = int(first_frame) + i
             row: dict = {
                 "frame_nmr":        str(fn),
                 "car_id":           str(car_id),
@@ -128,7 +128,7 @@ def interpolate_csv(src_path: str) -> str:
                 "license_plate_bbox": _fmt_bbox(pb),
             }
 
-            if str(fn) in frame_numbers_:
+            if fn in real_frame_numbers:
                 orig = next(
                     p for p in data
                     if int(p["frame_nmr"]) == fn
@@ -144,7 +144,6 @@ def interpolate_csv(src_path: str) -> str:
 
             interpolated.append(row)
 
-    # Sort by frame_nmr then car_id (matches reference pipeline output order)
     interpolated.sort(key=lambda r: (int(r["frame_nmr"]), int(float(r["car_id"]))))
 
     with open(dst, "w", newline="", encoding="utf-8") as f:
@@ -152,7 +151,7 @@ def interpolate_csv(src_path: str) -> str:
         writer.writeheader()
         writer.writerows(interpolated)
 
-    logger.info("Interpolation complete: %d rows → %s", len(interpolated), dst)
+    logger.info("Interpolation complete: %d rows -> %s", len(interpolated), dst)
     return str(dst)
 
 
@@ -165,4 +164,4 @@ if __name__ == "__main__":
     parser.add_argument("--csv", required=True, help="Path to results_rich.csv")
     args = parser.parse_args()
     out = interpolate_csv(args.csv)
-    print(f"Written → {out}")
+    print(f"Written -> {out}")

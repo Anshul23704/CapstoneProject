@@ -1,33 +1,34 @@
 """
-stage6_worker_pool.py — Worker Pool (Plate Detection + OCR)
+stage6_worker_pool.py — Worker Pool (OCR only).
 
-INTEGRATION CHANGES (vs previous version)
-──────────────────────────────────────────
-1. Imported `license_complies_format` and `format_license` from the reference
-   pipeline's util logic (inlined here so no extra module dependency).
-   These replace the loose regex-only check that was accepting garbage like
-   "DFAMGEO1VISI" and "5" as valid plates.
+ARCHITECTURE CHANGE vs previous version
+─────────────────────────────────────────
+Plate detection no longer happens here. It used to run per-worker, per
+selected frame, on a small padded per-vehicle ROI — meaning up to
+TOP_K_FRAMES separate detector calls per vehicle, each at a different
+effective resolution, AND every worker thread loading its own full copy of
+the plate-detector model. Two rounds of tuning that in isolation (imgsz,
+IoA slack) both backfired, because the fundamental problem wasn't the
+threshold — it was that the detector was seeing small, inconsistent,
+context-free crops instead of full frames.
 
-2. `_run_ocr` now mirrors the reference `read_license_plate` flow:
-   - Iterates every EasyOCR detection independently (not joined).
-   - Uppercases and strips spaces/dashes before validation.
-   - Calls `license_complies_format` (strict 7-char positional check).
-   - Calls `format_license` (positional char-swap) only on passing text.
-   - Returns the first detection that passes — same as reference pipeline.
+Plate detection now runs exactly once per frame, full-frame, in
+plate_detection.py (Stage 2.5), and Stage 3 already matched each vehicle's
+frames to a plate_bbox (full-frame coordinates) via IoA at buffering time.
+By the time a job reaches this stage, every selected frame either already
+has a known plate_bbox or it doesn't — this stage's only job is: crop it,
+enhance it, OCR it. No detector model is loaded here anymore.
 
-3. `_detect_plate_in_frame` now performs a spatial containment check
-   (plate bbox must lie inside vehicle bbox) identical to `get_car` in the
-   reference pipeline. This prevents plates from neighbouring vehicles
-   being assigned to the wrong track.
-
-4. `frame_readings` now stores (formatted_text, conf) pairs so Stage 7
-   temporal fusion receives already-validated, formatted strings.
+This stage also now forwards a raw per-frame detection record for EVERY
+frame with a matched plate_bbox — regardless of whether OCR produced valid
+text — via RecognitionResult.raw_detections. main_pipeline.py uses this to
+give Stage 10 a box to draw on every frame with a real detection, not only
+frames whose OCR happened to fully validate.
 """
 
 from __future__ import annotations
 
 import logging
-import string
 import threading
 from dataclasses import dataclass
 from enum import Enum, auto
@@ -37,65 +38,84 @@ from typing import List, Optional, Tuple
 import cv2
 import easyocr
 import numpy as np
-from ultralytics import YOLO
+
+import config
+from plate_utils import (
+    clean_ocr_text,
+    enhance_plate_crop,
+    laplacian_sharpness,
+    license_complies_format,
+    format_license,
+)
 
 logger = logging.getLogger(__name__)
 
 BBox = Tuple[int, int, int, int]
 
 
-# ── Licence-plate format helpers (ported from reference util.py) ──────────────
-
-# Characters that OCR confuses in digit positions
-_CHAR_TO_INT = {
-    'O': '0', 'I': '1', 'J': '3',
-    'A': '4', 'G': '6', 'S': '5',
-}
-# Characters that OCR confuses in letter positions
-_INT_TO_CHAR = {v: k for k, v in _CHAR_TO_INT.items()}
-
-
-def license_complies_format(text: str) -> bool:
+class _DiagnosticCounters:
     """
-    Strict 7-character positional check (ported from reference util.py).
-    Layout: LL DD LLL  (L=letter, D=digit)
-    Positions 0,1,4,5,6 must be letters (or OCR-confusable letters).
-    Positions 2,3 must be digits (or OCR-confusable digits).
+    DIAGNOSTIC (temporary): tallies, across all worker threads, how many
+    frames survive each step of the OCR pipeline. Printed once by
+    WorkerPoolStage.shutdown().
     """
-    if len(text) != 7:
-        return False
-    alpha_ok = set(string.ascii_uppercase) | set(_INT_TO_CHAR.keys())
-    digit_ok  = set('0123456789')         | set(_CHAR_TO_INT.keys())
-    checks = [
-        text[0] in alpha_ok,
-        text[1] in alpha_ok,
-        text[2] in digit_ok,
-        text[3] in digit_ok,
-        text[4] in alpha_ok,
-        text[5] in alpha_ok,
-        text[6] in alpha_ok,
-    ]
-    return all(checks)
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self.frames_seen        = 0
+        self.skipped_blurry     = 0
+        self.no_plate_bbox      = 0   # frame selected but Stage 3 never matched a plate to it
+        self.crop_empty         = 0   # matched plate_bbox produced an empty/invalid crop
+        self.ocr_empty          = 0   # frames where EasyOCR returned zero detections
+        self.ocr_format_rejected = 0  # every OCR detection too short/long to plausibly be a plate
+        self.ocr_forwarded_plausible = 0  # forwarded to fusion without being independently valid
+        self.ocr_format_passed  = 0   # already a fully valid plate on its own
+
+    def bump(self, field: str) -> None:
+        with self._lock:
+            setattr(self, field, getattr(self, field) + 1)
+
+    def report(self) -> str:
+        return (
+            "\n" + "=" * 60 +
+            "\n  PLATE PIPELINE DIAGNOSTIC (temporary instrumentation)\n" +
+            "=" * 60 +
+            f"\n  Frames attempted (selected) : {self.frames_seen}"
+            f"\n  Skipped (too blurry)        : {self.skipped_blurry}"
+            f"\n  No plate_bbox from Stage 3  : {self.no_plate_bbox}"
+            f"\n  Empty/invalid crop          : {self.crop_empty}"
+            f"\n  OCR returned 0 detections   : {self.ocr_empty}"
+            f"\n  OCR too short/long (noise)  : {self.ocr_format_rejected}"
+            f"\n  OCR forwarded to fusion     : {self.ocr_forwarded_plausible}  (plausible length, not independently valid)"
+            f"\n  OCR fully valid on its own  : {self.ocr_format_passed}"
+            "\n" + "=" * 60
+        )
 
 
-def format_license(text: str) -> str:
-    """
-    Positional character correction (ported from reference util.py).
-    Applies char-swap only in the correct position class.
-    """
-    mapping = {
-        0: _INT_TO_CHAR, 1: _INT_TO_CHAR,
-        2: _CHAR_TO_INT, 3: _CHAR_TO_INT,
-        4: _INT_TO_CHAR, 5: _INT_TO_CHAR, 6: _INT_TO_CHAR,
-    }
-    out = []
-    for j in range(7):
-        ch = text[j]
-        out.append(mapping[j].get(ch, ch))
-    return "".join(out)
+DIAG = _DiagnosticCounters()
+
+# DIAGNOSTIC (temporary): saves a capped sample of the actual crops fed to
+# EasyOCR at each failure point, plus the raw text EasyOCR returned.
+import os as _os
+_DEBUG_DIR = _os.path.join(_os.getcwd(), "debug_plate_crops")
+_DEBUG_MAX_PER_CATEGORY = 25
+_DEBUG_LOCK = threading.Lock()
+_DEBUG_COUNTS: dict = {}
 
 
-# ─────────────────────────────────────────────────────────────────────────────
+def _debug_save(category: str, img: np.ndarray, tag: str = "") -> None:
+    with _DEBUG_LOCK:
+        if _DEBUG_COUNTS.get(category, 0) >= _DEBUG_MAX_PER_CATEGORY:
+            return
+        _DEBUG_COUNTS[category] = _DEBUG_COUNTS.get(category, 0) + 1
+        n = _DEBUG_COUNTS[category]
+    try:
+        cat_dir = _os.path.join(_DEBUG_DIR, category)
+        _os.makedirs(cat_dir, exist_ok=True)
+        fname = f"{n:03d}{('_' + tag) if tag else ''}.png"
+        cv2.imwrite(_os.path.join(cat_dir, fname), img)
+    except Exception:
+        logger.exception("debug_save failed for category=%s", category)
+
 
 class RecognitionStatus(Enum):
     SUCCESS  = auto()
@@ -112,19 +132,25 @@ class RecognitionResult:
     status:         RecognitionStatus
     plate_bbox:     Optional[BBox] = None
     best_crop_path: str = ""
-    # Per-frame OCR readings forwarded to Stage 7 temporal fusion.
-    # Each entry is (formatted_text, conf) — already validated & formatted.
+    # Per-frame OCR readings forwarded to Stage 7 temporal fusion AND used by
+    # main_pipeline.py to emit one CSV row per successful frame. Each entry
+    # is (formatted_text, conf, vehicle_bbox, plate_bbox_full, frame_idx) —
+    # text/conf already validated & formatted; only frames with plausible OCR
+    # text are included here.
     frame_readings: tuple = ()
+    # NEW: every frame with a matched plate_bbox, regardless of OCR outcome
+    # — (vehicle_bbox, plate_bbox, frame_idx, ocr_text_or_empty, ocr_conf).
+    # Lets Stage 10 draw a box on every frame with a real detection, not
+    # only frames whose OCR happened to fully validate.
+    raw_detections: tuple = ()
 
 
 @dataclass
 class WorkerConfig:
-    plate_model_path: str   = "E:\\Capstone\\implementation\\models\\license_plate_detector.pt"
-    plate_conf:       float = 0.25
-    plate_padding:    int   = 6
-    use_gpu:          bool  = True
-    upscale_factor:   float = 2.0
-    min_plate_area:   int   = 200
+    plate_padding:    int   = config.PLATE_PADDING
+    use_gpu:          bool  = (config.DEVICE == "cuda")
+    upscale_factor:   float = config.PLATE_UPSCALE_FACTOR
+    blur_threshold:   float = config.BLUR_THRESHOLD
 
 
 class Worker(threading.Thread):
@@ -134,9 +160,6 @@ class Worker(threading.Thread):
         self.job_q    = job_q
         self.result_q = result_q
         self.cfg      = config
-
-        logger.info("Worker init: loading plate detector from %s", config.plate_model_path)
-        self.plate_detector = YOLO(config.plate_model_path)
 
         logger.info("Worker init: loading EasyOCR (gpu=%s)", config.use_gpu)
         self.ocr = easyocr.Reader(['en'], gpu=config.use_gpu, verbose=False)
@@ -165,171 +188,119 @@ class Worker(threading.Thread):
     def _process(self, job) -> RecognitionResult:
         """
         For each selected frame:
-          1. Run plate detector on the padded ROI.
-          2. Perform spatial containment check (plate must be inside vehicle bbox)
-             — mirrors get_car() from the reference pipeline.
-          3. Preprocess the plate crop.
-          4. Run OCR with strict format validation + positional correction.
-          5. Collect validated (text, conf) pairs for Stage 7.
+          1. Skip the frame outright if its vehicle crop is too blurry to be
+             worth an OCR call (Slide 5/17 commitment).
+          2. Use the plate_bbox Stage 3 already matched (full-frame coords)
+             — no detection happens here anymore.
+          3. Crop it out of the stored ROI, enhance it (CLAHE + sharpen +
+             upscale), OCR it with strict format validation + correction.
+          4. Record it in raw_detections (always, if a plate_bbox existed)
+             and in frame_readings (only if OCR produced plausible text).
         """
         best_text  = ""
         best_conf  = 0.0
         best_bbox: Optional[BBox] = None
-        frame_readings: List[Tuple[str, float]] = []
+        frame_readings: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
+        raw_detections: List[Tuple[BBox, Optional[BBox], int, str, float]] = []
 
         for frame_entry in job.selected_frames:
-            roi = getattr(frame_entry, 'full_frame', None)
 
-            if roi is None or roi.size == 0:
-                roi = frame_entry.crop
-                roi_offset = (0, 0)
-            else:
-                roi_offset = getattr(frame_entry, 'roi_offset', (0, 0))
-
-            ox, oy = roi_offset
-            vx1, vy1, vx2, vy2 = frame_entry.bbox
-            vehicle_bbox_roi = (
-                max(0, vx1 - ox),
-                max(0, vy1 - oy),
-                max(0, vx2 - ox),
-                max(0, vy2 - oy),
-            )
-
-            plate_crop, plate_bbox_roi = self._detect_plate_in_frame(
-                roi, vehicle_bbox_roi
-            )
-
-            if plate_crop is None:
-                logger.debug("No plate in frame %d for track %d",
-                             frame_entry.frame_idx, job.track_id)
+            if laplacian_sharpness(frame_entry.crop) < self.cfg.blur_threshold:
+                DIAG.bump("skipped_blurry")
                 continue
 
-            if plate_bbox_roi is not None:
-                px1, py1, px2, py2 = plate_bbox_roi
-                plate_bbox_full = (px1 + ox, py1 + oy, px2 + ox, py2 + oy)
-            else:
-                plate_bbox_full = None
+            DIAG.bump("frames_seen")
 
-            plate_ready = self._preprocess_plate(plate_crop)
+            if frame_entry.plate_bbox is None:
+                DIAG.bump("no_plate_bbox")
+                continue
 
-            # INTEGRATION: use validated OCR (reference read_license_plate flow)
-            text, conf = self._run_ocr_validated(plate_ready)
+            plate_crop = self._crop_plate(frame_entry)
+            if plate_crop is None or plate_crop.size == 0:
+                DIAG.bump("crop_empty")
+                continue
+
+            plate_ready = enhance_plate_crop(plate_crop, upscale_factor=self.cfg.upscale_factor)
+
+            text, conf = self._run_ocr_validated(
+                plate_ready, tag=f"t{job.track_id}_f{frame_entry.frame_idx}"
+            )
+
+            raw_detections.append((
+                frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx,
+                text, conf,
+            ))
 
             if text:
-                frame_readings.append((text, conf))
+                frame_readings.append(
+                    (text, conf, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
+                )
                 if conf > best_conf:
                     best_conf = conf
                     best_text = text
-                    best_bbox = plate_bbox_full
+                    best_bbox = frame_entry.plate_bbox
 
-        if best_text:
-            return RecognitionResult(
-                job_id         = job.job_id,
-                track_id       = job.track_id,
-                plate_text     = best_text,
-                confidence     = best_conf,
-                status         = RecognitionStatus.SUCCESS,
-                plate_bbox     = best_bbox,
-                frame_readings = tuple(frame_readings),
-            )
+        status = RecognitionStatus.SUCCESS if best_text else RecognitionStatus.NO_PLATE
 
         return RecognitionResult(
             job_id         = job.job_id,
             track_id       = job.track_id,
-            plate_text     = "",
-            confidence     = 0.0,
-            status         = RecognitionStatus.NO_PLATE,
+            plate_text     = best_text,
+            confidence     = best_conf,
+            status         = status,
+            plate_bbox     = best_bbox,
             frame_readings = tuple(frame_readings),
+            raw_detections = tuple(raw_detections),
         )
 
-    # ── Plate detection with containment check ────────────────────────────────
+    # ── Cropping (no detection — plate_bbox is already known) ─────────────────
 
-    def _detect_plate_in_frame(
-        self,
-        frame: np.ndarray,
-        vehicle_bbox_roi: Tuple[int, int, int, int],
-    ) -> Tuple[Optional[np.ndarray], Optional[BBox]]:
+    @staticmethod
+    def _crop_plate(frame_entry) -> Optional[np.ndarray]:
         """
-        Runs the plate detector and returns the best plate crop that is
-        spatially contained within vehicle_bbox_roi.
-
-        INTEGRATION: containment check mirrors get_car() from reference
-        pipeline — the plate bbox (x1,y1,x2,y2) must lie strictly inside
-        the vehicle bbox. This stops plates from adjacent vehicles being
-        assigned to the wrong track.
+        plate_bbox is in FULL-FRAME coordinates (set by Stage 3 from Stage
+        2.5's full-frame detection). frame_entry.full_frame is the padded
+        ROI stored for this frame, offset by frame_entry.roi_offset — so we
+        translate plate_bbox into ROI-local coordinates once, here, and
+        nowhere else in the pipeline.
         """
-        results = self.plate_detector(frame, conf=self.cfg.plate_conf, verbose=False)[0]
+        roi = frame_entry.full_frame
+        if roi is None or roi.size == 0:
+            return None
 
-        if results.boxes is None or len(results.boxes) == 0:
-            return None, None
+        ox, oy = frame_entry.roi_offset
+        px1, py1, px2, py2 = frame_entry.plate_bbox
+        rh, rw = roi.shape[:2]
 
-        vx1, vy1, vx2, vy2 = vehicle_bbox_roi
-        best_conf = -1.0
-        best_box  = None
+        lx1 = max(0, px1 - ox)
+        ly1 = max(0, py1 - oy)
+        lx2 = min(rw, px2 - ox)
+        ly2 = min(rh, py2 - oy)
 
-        for i in range(len(results.boxes)):
-            px1, py1, px2, py2 = map(int, results.boxes.xyxy[i])
-            conf       = float(results.boxes.conf[i])
-            plate_area = max(1, (px2 - px1) * (py2 - py1))
+        if lx2 <= lx1 or ly2 <= ly1:
+            return None
 
-            if plate_area < self.cfg.min_plate_area:
-                continue
+        p = config.PLATE_PADDING
+        lx1 = max(0, lx1 - p); ly1 = max(0, ly1 - p)
+        lx2 = min(rw, lx2 + p); ly2 = min(rh, ly2 + p)
 
-            # INTEGRATION: containment check (from get_car in reference util.py)
-            # Plate must be fully inside the vehicle bbox in ROI coordinates.
-            contained = (px1 > vx1 and py1 > vy1 and px2 < vx2 and py2 < vy2)
-            if not contained:
-                logger.debug(
-                    "Plate bbox (%d,%d,%d,%d) not contained in vehicle bbox "
-                    "(%d,%d,%d,%d) — skipped",
-                    px1, py1, px2, py2, vx1, vy1, vx2, vy2,
-                )
-                continue
+        return roi[ly1:ly2, lx1:lx2].copy()
 
-            if conf > best_conf:
-                best_conf = conf
-                best_box  = (px1, py1, px2, py2)
+    # ── OCR with strict validation ─────────────────────────────────────────────
 
-        if best_box is None:
-            return None, None
+    _MIN_PLATE_LEN = 8
+    _MAX_PLATE_LEN = 10
 
-        px1, py1, px2, py2 = best_box
-        p  = self.cfg.plate_padding
-        h, w = frame.shape[:2]
-        px1 = max(0, px1 - p);  py1 = max(0, py1 - p)
-        px2 = min(w, px2 + p);  py2 = min(h, py2 + p)
-
-        return frame[py1:py2, px1:px2].copy(), (px1, py1, px2, py2)
-
-    # ── Preprocessing ─────────────────────────────────────────────────────────
-
-    def _preprocess_plate(self, plate_crop: np.ndarray) -> np.ndarray:
-        h, w = plate_crop.shape[:2]
-        if w < 120 or h < 30:
-            scale = max(self.cfg.upscale_factor, 120 / max(w, 1), 30 / max(h, 1))
-            plate_crop = cv2.resize(plate_crop,
-                                    (int(w * scale), int(h * scale)),
-                                    interpolation=cv2.INTER_CUBIC)
-        gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-        _, thresh = cv2.threshold(gray, 64, 255, cv2.THRESH_BINARY_INV)
-        return cv2.cvtColor(thresh, cv2.COLOR_GRAY2BGR)
-
-    # ── OCR with strict validation (reference pipeline flow) ──────────────────
-
-    def _run_ocr_validated(self, plate_img: np.ndarray) -> Tuple[str, float]:
+    def _run_ocr_validated(self, plate_img: np.ndarray, tag: str = "") -> Tuple[str, float]:
         """
-        INTEGRATION: mirrors read_license_plate() from reference util.py.
-
-        Key differences from the old _run_ocr:
-        - Does NOT join all detections into one string.
-        - Validates each detection independently with license_complies_format.
-        - Applies positional format_license correction only on passing text.
-        - Returns the first detection that passes the format check.
-
-        This is why "DFAMGEO1VISI" (13 chars) and "5" (1 char) were
-        previously returned — they were never length-checked. Now they
-        are silently rejected and the result is NO_PLATE rather than a
-        garbage INVALID plate.
+        Iterates every EasyOCR detection, applies OCR-confusion correction
+        (format_license), and returns the best candidate. Correct first,
+        then return the first ALREADY-valid corrected candidate immediately;
+        if none of this frame's detections corrects to a fully valid plate,
+        still forward the highest-confidence length-plausible candidate
+        (8-10 chars) so it can contribute to Stage 7 fusion. Only true noise
+        (too short/too long to plausibly be a plate) is dropped here — final
+        validity is enforced on the FUSED result by Stage 7, not per-frame.
         """
         detections = self.ocr.readtext(
             plate_img,
@@ -343,25 +314,51 @@ class Worker(threading.Thread):
         )
 
         if not detections:
+            DIAG.bump("ocr_empty")
+            _debug_save("ocr_empty", plate_img, tag=tag)
             return "", 0.0
 
+        plausible: List[Tuple[str, float]] = []
+        raw_seen: List[str] = []
         for (_bbox, text, conf) in detections:
-            clean = text.upper().replace(" ", "").replace("-", "")
+            clean = clean_ocr_text(text)
             if not clean:
                 continue
-            if license_complies_format(clean):
-                formatted = format_license(clean)
-                logger.debug("OCR accepted: '%s' → '%s' conf=%.3f", clean, formatted, conf)
-                return formatted, float(conf)
+            corrected = format_license(clean)
+            raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
 
-        # No detection passed the format check
+            if license_complies_format(corrected):
+                logger.debug("OCR accepted (fully valid): '%s' -> '%s' conf=%.3f",
+                              clean, corrected, conf)
+                DIAG.bump("ocr_format_passed")
+                return corrected, float(conf)
+
+            if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
+                plausible.append((corrected, float(conf)))
+
+        if plausible:
+            DIAG.bump("ocr_forwarded_plausible")
+            best_text, best_conf = max(plausible, key=lambda x: x[1])
+            logger.debug(
+                "OCR forwarded (length-plausible, not independently valid): '%s' conf=%.3f",
+                best_text, best_conf,
+            )
+            return best_text, best_conf
+
+        if raw_seen:
+            DIAG.bump("ocr_format_rejected")
+            logger.info("OCR true-reject (too short/long) [%s]: %s", tag, "; ".join(raw_seen))
+            _debug_save("ocr_format_rejected", plate_img, tag=tag)
+        else:
+            DIAG.bump("ocr_empty")
+            _debug_save("ocr_empty", plate_img, tag=tag)
         return "", 0.0
 
 
 class WorkerPoolStage:
 
     def __init__(self, job_q: Queue, result_q: Queue,
-                 num_workers: int = 2, config: WorkerConfig = None):
+                 num_workers: int = config.NUM_WORKERS, config: WorkerConfig = None):
         self.job_q    = job_q
         self.result_q = result_q
         cfg           = config or WorkerConfig()
@@ -377,3 +374,4 @@ class WorkerPoolStage:
         for w in self.workers:
             w.join()
         logger.info("All workers shut down cleanly.")
+        logger.info(DIAG.report())

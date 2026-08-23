@@ -3,10 +3,11 @@ import logging
 import uuid
 from dataclasses import dataclass
 from queue import Queue, Full
-from typing import Optional, Set
+from typing import List, Optional, Set
 import numpy as np
-import cv2
 
+import config
+from plate_utils import laplacian_sharpness
 from stage3_active_buffering import FrameEntry
 from stage4_vehicle_finalization import FinalizedVehicle
 
@@ -17,7 +18,7 @@ logger = logging.getLogger(__name__)
 class ProcessingJob:
     job_id:             str
     track_id:           int
-    selected_frames:    tuple      
+    selected_frames:    tuple
     track_duration:     int
     avg_bbox_area:      float
     finalize_reason:    str
@@ -29,8 +30,8 @@ class ProcessingJob:
 
 @dataclass
 class JobCreationConfig:
-    top_k = 20  
-    blur_threshold: float = 80.0    # Laplacian variance below this → low quality
+    top_k: int = config.TOP_K_FRAMES
+    blur_threshold: float = config.BLUR_THRESHOLD    # Laplacian variance below this → low quality
 
 
 class JobCreationStage:
@@ -45,17 +46,40 @@ class JobCreationStage:
         if fv.track_id in self._dispatched_ids:
             return None
 
-        # Sort all frames by sharpness descending, keep top-k
-        ranked = sorted(
-            fv.frames,
-            key=lambda f: self._sharpness(f.crop),
-            reverse=True,
-        )
-        selected = ranked[: self.cfg.top_k]
+        # FIX: Stage 2.5 now runs plate detection once per frame, full-frame,
+        # during buffering — so by the time a vehicle reaches this stage we
+        # already know exactly which of its frames have a matched plate_bbox
+        # (frame_entry.plate_bbox is not None) and which don't. Selecting by
+        # sharpness alone (the old behaviour) routinely sent frames with NO
+        # detected plate at all to OCR, wasting Stage 6 work on crops that
+        # were never going to produce a reading. We now rank
+        # (has_plate, plate_conf, sharpness) so frames with a real detection
+        # are always preferred, and only fall back to plate-less frames if a
+        # vehicle's ENTIRE track never got one (so it still gets *a* result
+        # rather than being silently dropped).
+        def _rank_key(f: FrameEntry):
+            has_plate = f.plate_bbox is not None
+            return (has_plate, f.plate_conf if has_plate else 0.0, self._sharpness(f.crop))
 
-        # low_quality: True when even the sharpest selected frame is blurry.
-        # Previously this was always hardcoded False — the blur_threshold
-        # config was declared but never applied.
+        scored = sorted(fv.frames, key=_rank_key, reverse=True)
+
+        plated_frames: List[FrameEntry] = [f for f in scored if f.plate_bbox is not None]
+
+        # Within the plated frames, still respect the blur gate (Slide 5/17's
+        # "actively drop blurry/occluded frames before OCR" commitment) —
+        # fall back to the full plated set if every plated frame is blurry,
+        # and fall back further to the unplated set only if there was no
+        # plate detection anywhere in the track.
+        sharp_plated = [f for f in plated_frames if self._sharpness(f.crop) >= self.cfg.blur_threshold]
+        if sharp_plated:
+            pool = sharp_plated
+        elif plated_frames:
+            pool = plated_frames
+        else:
+            pool = scored  # no plate ever detected on this track — best-effort fallback
+
+        selected = pool[: self.cfg.top_k]
+
         best_sharpness = self._sharpness(selected[0].crop) if selected else 0.0
         low_quality = best_sharpness < self.cfg.blur_threshold
 
@@ -76,8 +100,8 @@ class JobCreationStage:
             self.queue.put(job)
             self._dispatched_ids.add(fv.track_id)
             logger.debug(
-                "Dispatched job=%s track=%s low_quality=%s",
-                job.job_id, job.track_id, low_quality,
+                "Dispatched job=%s track=%s frames_selected=%d/%d low_quality=%s",
+                job.job_id, job.track_id, len(selected), len(fv.frames), low_quality,
             )
             return job
         except Full:
@@ -86,8 +110,4 @@ class JobCreationStage:
 
     @staticmethod
     def _sharpness(crop: np.ndarray) -> float:
-        """Laplacian variance — higher means sharper."""
-        if crop is None or crop.size == 0:
-            return 0.0
-        gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY)
-        return float(cv2.Laplacian(gray, cv2.CV_64F).var())
+        return laplacian_sharpness(crop)

@@ -1,26 +1,28 @@
 
+
 from __future__ import annotations
 
 import csv
 import logging
 import os
 import sys
+import threading
 from datetime import datetime
 from queue import Empty, Queue
+from typing import List
 
-import cv2
-import numpy as np
-from ultralytics import YOLO
-import supervision as sv
-import easyocr
-
+import config
 from stage1_frame_ingestion      import FrameIngestionStage, FrameIngestionConfig
+from stage2_detection_tracking   import DetectionTrackingStage, DetectionConfig
+from plate_detection             import PlateDetectionStage, PlateDetectionConfig
 from stage3_active_buffering     import ActiveBufferingStage, BufferingConfig
-from stage4_vehicle_finalization import VehicleFinalizationStage
-from stage5_job_creation         import JobCreationStage
+from stage4_vehicle_finalization import VehicleFinalizationStage, FinalizationConfig
+from stage5_job_creation         import JobCreationStage, JobCreationConfig
+from stage6_worker_pool          import WorkerPoolStage, WorkerConfig, RecognitionStatus
+from stage7_temporal_fusion      import TemporalFusionStage, FusionConfig
 from stage8_database_analytics   import DatabaseAnalyticsStage, DatabaseConfig
 from stage9_interpolation        import interpolate_csv
-
+from stage10_visualize           import render_annotated_video
 
 
 logging.basicConfig(
@@ -31,96 +33,17 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-RUN_ID       = datetime.now().strftime("%Y%m%d_%H%M%S")
-OUTPUT_DIR   = os.path.join("output", RUN_ID)
-VIDEO_SOURCE = "E:\\Capstone\\dataset\\test2.mp4"
-MODEL_VEHICLE = "E:\\Capstone\\implementation\\models\\yolo26s.pt"
-MODEL_PLATE   = "E:\\Capstone\\implementation\\models\\license_plate_detector.pt"
-
-RICH_CSV_PATH = os.path.join(OUTPUT_DIR, "results_rich.csv")
-DB_PATH       = os.path.join(OUTPUT_DIR, "results.db")
+RUN_ID     = datetime.now().strftime("%Y%m%d_%H%M%S")
+OUTPUT_DIR = os.path.join(config.OUTPUT_ROOT, RUN_ID)
 os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-
-VEHICLE_CLASSES = {2, 3, 5, 7}
-
-
-import string
-
-_CHAR_TO_INT = {'O': '0', 'I': '1', 'J': '3', 'A': '4', 'G': '6', 'S': '5'}
-_INT_TO_CHAR = {v: k for k, v in _CHAR_TO_INT.items()}
-
-
-def license_complies_format(text: str) -> bool:
-    if len(text) != 7:
-        return False
-    alpha_ok = set(string.ascii_uppercase) | set(_INT_TO_CHAR.keys())
-    digit_ok  = set('0123456789')          | set(_CHAR_TO_INT.keys())
-    return all([
-        text[0] in alpha_ok,
-        text[1] in alpha_ok,
-        text[2] in digit_ok,
-        text[3] in digit_ok,
-        text[4] in alpha_ok,
-        text[5] in alpha_ok,
-        text[6] in alpha_ok,
-    ])
-
-
-def format_license(text: str) -> str:
-    mapping = {
-        0: _INT_TO_CHAR, 1: _INT_TO_CHAR,
-        2: _CHAR_TO_INT, 3: _CHAR_TO_INT,
-        4: _INT_TO_CHAR, 5: _INT_TO_CHAR, 6: _INT_TO_CHAR,
-    }
-    return "".join(mapping[j].get(text[j], text[j]) for j in range(7))
-
-
-def read_license_plate(license_plate_crop: np.ndarray, ocr_reader) -> tuple:
-
-    detections = ocr_reader.readtext(license_plate_crop)
-    for detection in detections:
-        _, text, score = detection
-        text = text.upper().replace(' ', '').replace('-', '')
-        if license_complies_format(text):
-            return format_license(text), score
-    return None, None
-
-
-def get_car(license_plate_bbox, track_ids_array: np.ndarray):
-
-    x1, y1, x2, y2 = license_plate_bbox[:4]
-    for j in range(len(track_ids_array)):
-        xcar1, ycar1, xcar2, ycar2, car_id = track_ids_array[j]
-        if x1 > xcar1 and y1 > ycar1 and x2 < xcar2 and y2 < ycar2:
-            return track_ids_array[j]
-    return np.array([-1, -1, -1, -1, -1])
-
-
-
-print("Loading models...")
-vehicle_model = YOLO(MODEL_VEHICLE)
-plate_model   = YOLO(MODEL_PLATE)
-ocr_reader    = easyocr.Reader(['en'], gpu=True, verbose=False)
-print("Models loaded.\n")
-
-
-tracker = sv.ByteTrack(
-    track_activation_threshold=0.25,
-    lost_track_buffer=50,
-    minimum_matching_threshold=0.60,
-)
-
-
-processing_queue: Queue = Queue()
-result_queue:     Queue = Queue()
-
-ingestion    = FrameIngestionStage(FrameIngestionConfig(source=VIDEO_SOURCE,target_resolution=(1280, 720)))
-buffering    = ActiveBufferingStage(BufferingConfig())
-finalization = VehicleFinalizationStage()
-job_creator  = JobCreationStage(processing_queue)
-db           = DatabaseAnalyticsStage(DatabaseConfig(db_path=DB_PATH))
-
+RICH_CSV_PATH   = os.path.join(OUTPUT_DIR, "results_rich.csv")
+# NEW: every frame with a matched plate detection, regardless of whether OCR
+# fully validated that track — this is what Stage 10 now draws boxes from,
+# so "detect as many plates as possible" isn't gated by full OCR validation.
+RAW_CSV_PATH    = os.path.join(OUTPUT_DIR, "results_raw_detections.csv")
+DB_PATH         = os.path.join(OUTPUT_DIR, "results.db")
+ANNOTATED_VIDEO = os.path.join(OUTPUT_DIR, "annotated_output.mp4")
 
 _RICH_FIELDS = [
     "frame_nmr", "car_id",
@@ -130,180 +53,273 @@ _RICH_FIELDS = [
 ]
 
 
-all_frame_results: dict = {}
+def _result_consumer(
+    result_q: Queue,
+    stop_event: threading.Event,
+    fusion: TemporalFusionStage,
+    db: DatabaseAnalyticsStage,
+    run_id: str,
+    rows: List[dict],
+    raw_rows: List[dict],
+    stats: dict,
+) -> None:
+    """
+    Runs on its own thread. Drains RecognitionResults from Stage 6's worker
+    pool, applies Stage 7 temporal fusion across each vehicle's
+    frame_readings, writes the fused result to Stage 8's DB, and stages CSV
+    rows for two separate outputs:
 
-detection_count = 0
-finalized_count = 0
-ocr_success     = 0
+    - `rows` (-> results_rich.csv): only frames from tracks whose FUSED
+      result is fully valid — used for Stage 9 interpolation and the
+      "confirmed plate" analytics/count.
+    - `raw_rows` (-> results_raw_detections.csv): EVERY frame with a
+      matched plate detection, regardless of whether that track's fusion
+      ever validated — this is what Stage 10 draws boxes from now, so the
+      video shows every real detection instead of only fully-validated
+      ones. Label uses the per-frame OCR text if present, else the track's
+      fused text once known, else blank (box drawn, no label).
 
+    Exits once stop_event is set AND the queue has been fully drained —
+    stop_event alone isn't enough because workers may still be flushing
+    their last results when shutdown begins.
+    """
+    while True:
+        try:
+            result = result_q.get(timeout=0.5)
+        except Empty:
+            if stop_event.is_set():
+                break
+            continue
 
-print(f"Starting pipeline...  (outputs → {OUTPUT_DIR})\n")
+        try:
+            fused_text, fused_conf, is_valid = "", 0.0, False
 
-with ingestion:
-    total_frames = int(ingestion._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+            if result.status == RecognitionStatus.SUCCESS and result.frame_readings:
+                readings_for_fusion = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings]
+                fused_text, fused_conf, is_valid = fusion.process(readings_for_fusion)
 
-    for frame, frame_idx, ts in ingestion.frames():
-
-        all_frame_results[frame_idx] = {}
-
-        # ── Stage 2a: Vehicle detection ───────────────────────────────────────
-        raw = vehicle_model(frame, conf=0.25, iou=0.45, verbose=False)[0]
-        sv_dets = sv.Detections.from_ultralytics(raw)
-
-        # Keep only vehicle classes
-        mask = np.isin(sv_dets.class_id, list(VEHICLE_CLASSES))
-        sv_dets = sv_dets[mask]
-
-        # ByteTrack update
-        tracked = tracker.update_with_detections(sv_dets)
-        detection_count += len(tracked)
-
-        # Build track_map {track_id: bbox} and track_ids_array for get_car()
-        track_map: dict = {}
-        track_ids_rows = []
-        if tracked.tracker_id is not None:
-            for bbox, tid in zip(tracked.xyxy, tracked.tracker_id):
-                if tid is None:
-                    continue
-                x1, y1, x2, y2 = map(float, bbox)
-                track_map[int(tid)] = (int(x1), int(y1), int(x2), int(y2))
-                track_ids_rows.append([x1, y1, x2, y2, float(tid)])
-
-        track_ids_array = np.array(track_ids_rows) if track_ids_rows else np.empty((0, 5))
-
-        
-        plate_results = plate_model(frame, conf=0.25, verbose=False)[0]
-
-        for lp in plate_results.boxes.data.tolist():
-            px1, py1, px2, py2, score, class_id = lp
-
-            # Assign to vehicle using get_car (reference pipeline)
-            car_row = get_car(lp, track_ids_array)
-            car_id = int(car_row[4])
-            if car_id == -1:
-                continue
-
-            xcar1, ycar1, xcar2, ycar2 = map(int, car_row[:4])
-
-            # Crop and preprocess plate
-            lp_crop = frame[int(py1):int(py2), int(px1):int(px2)]
-            if lp_crop.size == 0:
-                continue
-
-            
-            lp_gray = cv2.cvtColor(lp_crop, cv2.COLOR_BGR2GRAY)
-            _, lp_thresh = cv2.threshold(lp_gray, 64, 255, cv2.THRESH_BINARY_INV)
-
-            # OCR
-            plate_text, plate_score = read_license_plate(lp_thresh, ocr_reader)
-
-            if plate_text is not None:
-                ocr_success += 1
-                all_frame_results[frame_idx][car_id] = {
-                    "car":   {"bbox": [xcar1, ycar1, xcar2, ycar2]},
-                    "license_plate": {
-                        "bbox":       [px1, py1, px2, py2],
-                        "text":       plate_text,
-                        "bbox_score": score,
-                        "text_score": plate_score,
-                    },
-                }
-
-                # Write to DB
                 db.insert_result(
-                    run_id=RUN_ID,
-                    track_id=car_id,
-                    job_id=f"{frame_idx}_{car_id}",
-                    plate_text=plate_text,
-                    confidence=plate_score,
-                    status="OK",
-                    is_valid=True,
+                    run_id=run_id,
+                    track_id=result.track_id,
+                    job_id=result.job_id,
+                    plate_text=fused_text,
+                    confidence=fused_conf,
+                    status=result.status.name,
+                    is_valid=is_valid,
+                    plate_bbox=result.plate_bbox,
+                    num_readings=len(result.frame_readings),
                 )
 
-        
-        ready_buffers = buffering.update(track_map, frame, frame_idx, ts)
-        for buf in ready_buffers:
-            fv = finalization.process(buf)
-            if fv:
+                if is_valid and fused_text:
+                    for (_t, _c, vehicle_bbox, plate_bbox_full, frame_idx) in result.frame_readings:
+                        if plate_bbox_full is None:
+                            continue
+                        rows.append({
+                            "frame_nmr":                frame_idx,
+                            "car_id":                   result.track_id,
+                            "car_bbox":                 "[{} {} {} {}]".format(*vehicle_bbox),
+                            "license_plate_bbox":       "[{} {} {} {}]".format(*plate_bbox_full),
+                            "license_plate_bbox_score": f"{fused_conf:.4f}",
+                            "license_number":           fused_text,
+                            "license_number_score":     f"{fused_conf:.4f}",
+                        })
+                    stats["fused_success"] += 1
+            else:
+                db.insert_result(
+                    run_id=run_id,
+                    track_id=result.track_id,
+                    job_id=result.job_id,
+                    plate_text="",
+                    confidence=0.0,
+                    status=result.status.name,
+                    is_valid=False,
+                    num_readings=len(result.frame_readings),
+                )
+                stats["no_plate"] += 1
+
+            # NEW: raw stream — every real detection, not just validated ones.
+            for (vehicle_bbox, plate_bbox_full, frame_idx, ocr_text, ocr_conf) in result.raw_detections:
+                if plate_bbox_full is None:
+                    continue
+                label = ocr_text or (fused_text if is_valid else "")
+                score = ocr_conf if ocr_text else (fused_conf if is_valid else 0.0)
+                raw_rows.append({
+                    "frame_nmr":                frame_idx,
+                    "car_id":                   result.track_id,
+                    "car_bbox":                 "[{} {} {} {}]".format(*vehicle_bbox),
+                    "license_plate_bbox":       "[{} {} {} {}]".format(*plate_bbox_full),
+                    "license_plate_bbox_score": f"{score:.4f}",
+                    "license_number":           label,
+                    "license_number_score":     f"{score:.4f}",
+                })
+        except Exception:
+            logger.exception("result_consumer failed on job=%s track=%s",
+                              result.job_id, result.track_id)
+        finally:
+            result_q.task_done()
+
+
+def run() -> None:
+    logger.info("Loading models (vehicle=%s, plate=%s, device=%s)...",
+                config.VEHICLE_MODEL_PATH, config.PLATE_MODEL_PATH, config.DEVICE)
+
+    detection_tracking = DetectionTrackingStage(DetectionConfig())
+    plate_detector      = PlateDetectionStage(PlateDetectionConfig())
+    buffering           = ActiveBufferingStage(BufferingConfig())
+    finalization        = VehicleFinalizationStage(FinalizationConfig())
+
+    processing_queue: Queue = Queue()
+    result_queue:     Queue = Queue()
+
+    job_creator = JobCreationStage(processing_queue, JobCreationConfig())
+    worker_pool = WorkerPoolStage(
+        processing_queue, result_queue,
+        num_workers=config.NUM_WORKERS, config=WorkerConfig(),
+    )
+    fusion = TemporalFusionStage(FusionConfig())
+    db     = DatabaseAnalyticsStage(DatabaseConfig(db_path=DB_PATH))
+
+    rows: List[dict] = []
+    raw_rows: List[dict] = []
+    stats = {"fused_success": 0, "no_plate": 0}
+    stop_event = threading.Event()
+
+    worker_pool.start()
+    consumer_thread = threading.Thread(
+        target=_result_consumer,
+        args=(result_queue, stop_event, fusion, db, RUN_ID, rows, raw_rows, stats),
+        daemon=True,
+    )
+    consumer_thread.start()
+
+    ingestion = FrameIngestionStage(
+        FrameIngestionConfig(source=config.VIDEO_SOURCE, target_resolution=(1280, 720))
+    )
+
+    finalized_count = 0
+    logger.info("Starting pipeline... (outputs -> %s)", OUTPUT_DIR)
+
+    with ingestion:
+        total_frames = ingestion.source_frame_count
+
+        for frame, frame_idx, ts in ingestion.frames():
+
+            # ── Main thread, GPU: Stage 2 detect + track ────────────────────
+            track_map = detection_tracking.process(frame)
+
+            # ── Stage 2.5, GPU: full-frame plate detection (once/frame) ─────
+            plate_detections = plate_detector.process(frame)
+
+            # ── Stage 3: buffer per-vehicle frames, match plates by IoA ─────
+            ready_buffers = buffering.update(
+                track_map, frame, frame_idx, ts, plate_detections=plate_detections
+            )
+
+            # ── Stage 4 + 5: finalize -> dispatch async job ─────────────────
+            for buf in ready_buffers:
+                fv = finalization.process(buf)
+                if fv is None:
+                    continue
                 finalized_count += 1
+                job_creator.dispatch(fv)   # non-blocking: workers pick this up
 
-        sys.stdout.write(
-            f"\rFrame {frame_idx + 1}/{total_frames} | "
-            f"Det:{detection_count} | "
-            f"Buf:{buffering.active_count} | "
-            f"Fin:{finalized_count} | "
-            f"OCR:{ocr_success}"
-        )
-        sys.stdout.flush()
+            sys.stdout.write(
+                f"\rFrame {frame_idx + 1}/{max(total_frames, 1)} | "
+                f"Active:{buffering.active_count} | "
+                f"Finalized:{finalized_count} | "
+                f"OK:{stats['fused_success']} | "
+                f"NoPlate:{stats['no_plate']}"
+            )
+            sys.stdout.flush()
 
+    print()
+    logger.info("Ingestion complete. Flushing vehicles still active at stream end...")
 
-print("\n\nWriting results CSV...")
+    # FIX: previously any vehicle still ACTIVE when the video ended was
+    # silently dropped — never finalized, never dispatched, never OCR'd.
+    for buf in buffering.flush_all():
+        fv = finalization.process(buf)
+        if fv is None:
+            continue
+        finalized_count += 1
+        job_creator.dispatch(fv)
 
-with open(RICH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-    writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
-    writer.writeheader()
+    logger.info("Waiting for worker pool to finish %d queued jobs...",
+                processing_queue.qsize())
+    processing_queue.join()
+    worker_pool.shutdown()
 
-    for frame_nmr, frame_data in sorted(all_frame_results.items()):
-        for car_id, data in frame_data.items():
-            if "car" not in data or "license_plate" not in data:
-                continue
-            if "text" not in data["license_plate"]:
-                continue
-            cb = data["car"]["bbox"]
-            pb = data["license_plate"]["bbox"]
-            writer.writerow({
-                "frame_nmr":              frame_nmr,
-                "car_id":                 car_id,
-                "car_bbox":               "[{} {} {} {}]".format(*cb),
-                "license_plate_bbox":     "[{} {} {} {}]".format(
-                                              pb[0], pb[1], pb[2], pb[3]),
-                "license_plate_bbox_score": data["license_plate"]["bbox_score"],
-                "license_number":         data["license_plate"]["text"],
-                "license_number_score":   data["license_plate"]["text_score"],
-            })
+    stop_event.set()
+    consumer_thread.join(timeout=30)
 
-print(f"  Rich CSV saved → {RICH_CSV_PATH}")
+    logger.info(
+        "Pipeline complete — finalized=%d fused_success=%d no_plate=%d",
+        finalized_count, stats["fused_success"], stats["no_plate"],
+    )
 
+    # ── Write rich CSV (fully-validated fused plates only) ──────────────────
+    rows.sort(key=lambda r: (r["frame_nmr"], r["car_id"]))
+    with open(RICH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
+        writer.writeheader()
+        writer.writerows(rows)
+    logger.info("Rich CSV saved -> %s", RICH_CSV_PATH)
 
-unique_plates: dict = {}
-for fd in all_frame_results.values():
-    for cid, data in fd.items():
-        if "license_plate" in data and "text" in data["license_plate"]:
-            plate = data["license_plate"]["text"].strip().upper()
-            score = data["license_plate"]["text_score"]
-            if plate and (plate not in unique_plates or score > unique_plates[plate]):
-                unique_plates[plate] = score
+    # ── Write raw detections CSV (every real detection, any track) ──────────
+    raw_rows.sort(key=lambda r: (r["frame_nmr"], r["car_id"]))
+    with open(RAW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
+        writer.writeheader()
+        writer.writerows(raw_rows)
+    logger.info("Raw detections CSV saved -> %s (%d rows)", RAW_CSV_PATH, len(raw_rows))
 
-print("\n" + "=" * 60)
-print(f"  PIPELINE COMPLETE — {RUN_ID}")
-print("=" * 60)
-print(f"  Frames processed : {ingestion.total_frames}")
-print(f"  Vehicles tracked : {finalized_count}")
-print(f"  OCR successes    : {ocr_success}")
-print(f"  Unique plates    : {len(unique_plates)}")
-if unique_plates:
-    print("\n  Detected plates:")
-    for plate, conf in sorted(unique_plates.items(), key=lambda x: -x[1]):
-        print(f"    {plate:<20}  conf={conf * 100:.1f}%")
-else:
-    print("  No plates detected.")
-print()
-print(f"  Rich CSV → {RICH_CSV_PATH}")
-print(f"  DB       → {DB_PATH}")
-print("=" * 60)
+    # ── Stage 8: analytics report ───────────────────────────────────────────
+    report_path = db.generate_report(run_id=RUN_ID, output_dir=OUTPUT_DIR)
+    if report_path:
+        logger.info("Analytics -> %s", report_path)
+    db.close()
 
-# ── Stage 8: analytics report ─────────────────────────────────────────────────
-report_path = db.generate_report(run_id=RUN_ID, output_dir=OUTPUT_DIR)
-if report_path:
-    print(f"  Analytics → {report_path}")
-db.close()
-
-# ── Stage 9: interpolation ────────────────────────────────────────────────────
-print("\nRunning Stage 9 — interpolation...")
-try:
-    interpolated_csv = interpolate_csv(RICH_CSV_PATH)
-    print(f"  Interpolated CSV → {interpolated_csv}")
-except Exception as exc:
-    logger.error("Stage 9 failed: %s", exc, exc_info=True)
+    # ── Stage 9: interpolation (of the validated/fused CSV only) ─────────────
     interpolated_csv = None
+    try:
+        interpolated_csv = interpolate_csv(RICH_CSV_PATH)
+        logger.info("Interpolated CSV -> %s", interpolated_csv)
+    except Exception:
+        logger.exception("Stage 9 (interpolation) failed")
 
+    # ── Stage 10: annotated video ────────────────────────────────────────────
+    # FIX: previously rendered from the interpolated *validated-fusion-only*
+    # CSV, so with only a handful of fully-validated tracks the entire video
+    # showed almost no boxes. Now renders from RAW_CSV_PATH — every frame
+    # with a real plate detection, for every track, whether or not that
+    # track's OCR ever fully validated — so the output actually reflects
+    # everything the model detected, with tight per-frame boxes (no
+    # interpolation needed for these: each row is a real detection, not a
+    # guess between two real ones).
+    if raw_rows:
+        try:
+            out = render_annotated_video(RAW_CSV_PATH, config.VIDEO_SOURCE, ANNOTATED_VIDEO)
+            if out:
+                logger.info("Annotated video -> %s", out)
+        except Exception:
+            logger.exception("Stage 10 (visualization) failed")
+    else:
+        logger.warning("No raw detections at all — skipping Stage 10 video render")
+
+    unique_plates = {row["license_number"] for row in rows}
+    print("\n" + "=" * 60)
+    print(f"  PIPELINE COMPLETE — {RUN_ID}")
+    print("=" * 60)
+    print(f"  Vehicles finalized      : {finalized_count}")
+    print(f"  Valid fused plates      : {stats['fused_success']}")
+    print(f"  No-plate vehicles       : {stats['no_plate']}")
+    print(f"  Unique plate texts      : {len(unique_plates)}")
+    print(f"  Raw detection boxes     : {len(raw_rows)}  (drawn in video regardless of OCR validity)")
+    print(f"  Rich CSV                : {RICH_CSV_PATH}")
+    print(f"  Raw detections CSV      : {RAW_CSV_PATH}")
+    print(f"  DB                      : {DB_PATH}")
+    print("=" * 60)
+
+
+if __name__ == "__main__":
+    run()

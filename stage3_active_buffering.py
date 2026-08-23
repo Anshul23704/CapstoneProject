@@ -2,16 +2,54 @@ from __future__ import annotations
 import copy
 from dataclasses import dataclass, field
 from enum import Enum, auto
-from typing import Dict, List, Optional, Set, Tuple
+from typing import Dict, List, Optional, Sequence, Set, Tuple
 import numpy as np
 import cv2
 
+import config
+from plate_utils import expand_bbox, intersection_over_area
+from plate_detection import PlateDetection
+
 BBox = Tuple[int, int, int, int]
 
-# ── Padding added around the vehicle bbox when saving the ROI.
-# Large enough to capture a plate that sticks out of the bbox slightly,
-# small enough to not balloon memory.
-_ROI_PAD = 80   # pixels
+# Padding added around the vehicle bbox when saving the ROI. Large enough to
+# capture a plate that sticks out of the bbox slightly, small enough not to
+# balloon memory.
+_ROI_PAD = config.ROI_PAD
+
+_IOA_THRESHOLD = config.PLATE_VEHICLE_IOA_THRESHOLD
+_ASSOC_EXPAND  = config.VEHICLE_BBOX_ASSOC_EXPAND
+
+
+def _match_plate(
+    vehicle_bbox: BBox,
+    plate_detections: Sequence[PlateDetection],
+    frame_shape,
+) -> Tuple[Optional[BBox], float]:
+    """
+    Associate the best plate detection (already in full-frame coordinates,
+    same as vehicle_bbox — see plate_detection.py) to this vehicle via IoA,
+    exactly as Slide 5 specifies. Everything here is in ONE coordinate
+    system; there is no ROI offset to get wrong.
+    """
+    if not plate_detections:
+        return None, 0.0
+
+    assoc_box = expand_bbox(vehicle_bbox, _ASSOC_EXPAND, frame_shape)
+
+    best_bbox: Optional[BBox] = None
+    best_conf = -1.0
+    best_ioa  = 0.0
+    for det in plate_detections:
+        ioa = intersection_over_area(det.bbox, assoc_box)
+        if ioa < _IOA_THRESHOLD:
+            continue
+        if det.conf > best_conf or (det.conf == best_conf and ioa > best_ioa):
+            best_conf = det.conf
+            best_bbox = det.bbox
+            best_ioa  = ioa
+
+    return best_bbox, (best_conf if best_bbox is not None else 0.0)
 
 
 class VehicleBufferState(Enum):
@@ -26,12 +64,18 @@ class FrameEntry:
     bbox:       BBox         # vehicle bbox in ORIGINAL full-frame coords
     frame_idx:  int
     timestamp:  float
-    # BUG FIX (memory): instead of storing the raw full frame (~6 MB each)
-    # we now store a padded ROI around the vehicle (~0.1-0.3 MB each).
-    # roi_offset records the (x0, y0) of the ROI so that bbox coords inside
-    # the ROI can be reconstructed by the worker.
+    # Instead of storing the raw full frame (~6 MB each) we store a padded
+    # ROI around the vehicle (~0.1-0.3 MB each). roi_offset records the
+    # (x0, y0) of the ROI so bbox coords inside it can be reconstructed.
     full_frame:  Optional[np.ndarray] = None   # padded ROI
     roi_offset:  Tuple[int, int]      = (0, 0) # (x_offset, y_offset) in original frame
+    # Plate box matched to this vehicle THIS FRAME by Stage 2.5's full-frame
+    # detection + Stage 3's IoA association — full-frame coordinates, same
+    # space as `bbox`. None if no plate was detected/associated this frame
+    # (that's expected on many frames; Stage 5 ranks selection toward frames
+    # where this IS set).
+    plate_bbox:  Optional[BBox] = None
+    plate_conf:  float          = 0.0
 
 
 @dataclass
@@ -55,9 +99,9 @@ class VehicleBuffer:
 
 @dataclass
 class BufferingConfig:
-    max_buffer_size:  int = 20
-    timeout_frames:   int = 30
-    force_finalize_at: int = 20
+    max_buffer_size:  int = config.BUFFER_MAX_SIZE
+    timeout_frames:   int = config.BUFFER_TIMEOUT_FRAMES
+    force_finalize_at: int = config.BUFFER_FORCE_FINALIZE_AT
     max_vehicles:     int = 20
     roi_polygon:      Optional[np.ndarray] = None
 
@@ -78,6 +122,7 @@ class ActiveBufferingStage:
         frame:      np.ndarray,
         frame_idx:  int,
         timestamp:  float,
+        plate_detections: Sequence[PlateDetection] = (),
     ) -> List[VehicleBuffer]:
 
         ready_for_finalization: List[VehicleBuffer] = []
@@ -94,9 +139,12 @@ class ActiveBufferingStage:
             if crop.size == 0:
                 continue
 
-            # BUG FIX: extract a padded ROI instead of the full frame
             roi, offset = self._safe_roi(frame, bbox, pad=_ROI_PAD)
-            self._append(buf, crop, bbox, frame_idx, timestamp, roi, offset)
+
+            plate_bbox, plate_conf = _match_plate(bbox, plate_detections, frame.shape)
+
+            self._append(buf, crop, bbox, frame_idx, timestamp, roi, offset,
+                         plate_bbox, plate_conf)
 
         # ── 2. Finalization sweep ─────────────────────────────────────────────
         for tid, buf in list(self._registry.items()):
@@ -115,12 +163,39 @@ class ActiveBufferingStage:
                 if buf.frames:
                     self._finalize(buf, "timeout")
                     ready_for_finalization.append(buf.to_snapshot())
-                    del self._registry[tid]  
+                    del self._registry[tid]
                 else:
                     buf.state = VehicleBufferState.DONE
                     self._finalised_ids.add(tid)
 
         return ready_for_finalization
+
+    def flush_all(self) -> List[VehicleBuffer]:
+        """
+        FIX: previously there was no way to drain vehicles that were still
+        ACTIVE (not yet timed out, not yet at force_finalize_at) when the
+        video stream ended — main_pipeline.py would just exit its ingestion
+        loop and every such vehicle's buffer was silently discarded, along
+        with any plates on it. This is easy to hit in practice: any vehicle
+        still visible in the last `timeout_frames` frames of the video, or
+        any vehicle that never accumulates `force_finalize_at` frames,
+        never gets a ready_for_finalization callback.
+
+        Call this once after the ingestion loop ends to force-finalize
+        every remaining active buffer that has at least one frame.
+        """
+        flushed: List[VehicleBuffer] = []
+        for tid, buf in list(self._registry.items()):
+            if not buf.is_active():
+                continue
+            if buf.frames:
+                self._finalize(buf, "stream_end")
+                flushed.append(buf.to_snapshot())
+            else:
+                buf.state = VehicleBufferState.DONE
+                self._finalised_ids.add(tid)
+            del self._registry[tid]
+        return flushed
 
     @property
     def active_count(self) -> int:
@@ -158,6 +233,8 @@ class ActiveBufferingStage:
         timestamp:  float,
         roi:        np.ndarray,
         roi_offset: Tuple[int, int],
+        plate_bbox: Optional[BBox] = None,
+        plate_conf: float = 0.0,
     ) -> None:
         buf.frames.append(
             FrameEntry(
@@ -167,6 +244,8 @@ class ActiveBufferingStage:
                 timestamp  = timestamp,
                 full_frame = roi,
                 roi_offset = roi_offset,
+                plate_bbox = plate_bbox,
+                plate_conf = plate_conf,
             )
         )
         buf.last_seen_frame = frame_idx

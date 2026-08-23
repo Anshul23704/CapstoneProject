@@ -103,6 +103,18 @@ class FrameIngestionStage:
             return 0.0
         return sum(self._fps_samples) / len(self._fps_samples)
 
+    @property
+    def source_frame_count(self) -> int:
+        """
+        Frame count reported by the container/codec (may be an estimate for
+        some formats). Public accessor — previously callers (main_pipeline.py)
+        reached into the private `_cap` attribute directly, which breaks
+        encapsulation and crashes if called before open().
+        """
+        if self._cap is None:
+            return 0
+        return int(self._cap.get(cv2.CAP_PROP_FRAME_COUNT))
+
     def __enter__(self):
         self.open()
         return self

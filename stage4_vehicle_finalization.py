@@ -7,6 +7,7 @@ from typing import Optional, Set
 import numpy as np
 import cv2
 
+import config
 from stage3_active_buffering import VehicleBuffer, FrameEntry
 
 logger = logging.getLogger(__name__)
@@ -28,9 +29,14 @@ class FinalizedVehicle:
 
 @dataclass
 class FinalizationConfig:
-    min_frames:            int   = 1
-    area_std_threshold:    float = 5000.0
-    diversity_ratio_limit: float = 0.95
+    # FIX: was hardcoded to 1, meaning "ensure minimum frame count for
+    # reliable processing" (Slide 16) was never actually enforced — a
+    # single-frame track (which single-frame OCR can't meaningfully improve
+    # on with temporal fusion) would sail straight through. Now sourced from
+    # config.MIN_FRAMES_FOR_RELIABLE.
+    min_frames:            int   = config.MIN_FRAMES_FOR_RELIABLE
+    area_std_threshold:    float = config.AREA_STD_THRESHOLD
+    diversity_ratio_limit: float = config.DIVERSITY_RATIO_LIMIT
 
 
 class VehicleFinalizationStage:
@@ -42,11 +48,15 @@ class VehicleFinalizationStage:
     def process(self, buf: VehicleBuffer) -> Optional[FinalizedVehicle]:
 
         if buf.track_id in self._finalized_ids:
-            return None   
+            return None
 
         visible_frames = [f for f in buf.frames if f.crop.size > 0]
 
         if len(visible_frames) < self.cfg.min_frames:
+            logger.debug(
+                "track=%s dropped: %d frames < min_frames=%d",
+                buf.track_id, len(visible_frames), self.cfg.min_frames,
+            )
             return None
 
         seen_idxs = set()
