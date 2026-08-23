@@ -29,13 +29,13 @@ frames whose OCR happened to fully validate.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 from dataclasses import dataclass
 from enum import Enum, auto
 from queue import Queue
 from typing import List, Optional, Tuple
 
-import os
 import cv2
 import easyocr
 import numpy as np
@@ -43,8 +43,9 @@ import numpy as np
 import config
 from plate_utils import (
     clean_ocr_text,
-    enhance_plate_crop,
+    deskew_plate_crop,
     enhance_plate_crop_bilateral,
+    enhance_plate_crop_adaptive,
     laplacian_sharpness,
     license_complies_format,
     format_license,
@@ -72,7 +73,8 @@ class _DiagnosticCounters:
         self.ocr_empty          = 0   # frames where EasyOCR returned zero detections
         self.ocr_format_rejected = 0  # every OCR detection too short/long to plausibly be a plate
         self.ocr_forwarded_plausible = 0  # forwarded to fusion without being independently valid
-        self.ocr_format_passed  = 0   # already a fully valid plate on its own
+        self.ocr_forwarded_bilateral = 0
+        self.ocr_forwarded_adaptive = 0
 
     def bump(self, field: str) -> None:
         with self._lock:
@@ -81,7 +83,7 @@ class _DiagnosticCounters:
     def report(self) -> str:
         return (
             "\n" + "=" * 60 +
-            "\n  PLATE PIPELINE DIAGNOSTIC (temporary instrumentation)\n" +
+            "\n  PLATE PIPELINE DIAGNOSTIC & BRANCH COMPARISON\n" +
             "=" * 60 +
             f"\n  Frames attempted (selected) : {self.frames_seen}"
             f"\n  Skipped (too blurry)        : {self.skipped_blurry}"
@@ -89,8 +91,9 @@ class _DiagnosticCounters:
             f"\n  Empty/invalid crop          : {self.crop_empty}"
             f"\n  OCR returned 0 detections   : {self.ocr_empty}"
             f"\n  OCR too short/long (noise)  : {self.ocr_format_rejected}"
-            f"\n  OCR forwarded to fusion     : {self.ocr_forwarded_plausible}  (plausible length, not independently valid)"
-            f"\n  OCR fully valid on its own  : {self.ocr_format_passed}"
+            f"\n  OCR forwarded to fusion     : {self.ocr_forwarded_plausible}"
+            f"\n    └─ Bilateral branch reads : {self.ocr_forwarded_bilateral}"
+            f"\n    └─ Adaptive branch reads  : {self.ocr_forwarded_adaptive}"
             "\n" + "=" * 60
         )
 
@@ -129,24 +132,22 @@ class RecognitionStatus(Enum):
 
 @dataclass
 class RecognitionResult:
-    job_id:         str
-    track_id:       int
-    plate_text:     str
-    confidence:     float
-    status:         RecognitionStatus
-    plate_bbox:     Optional[BBox] = None
-    best_crop_path: str = ""
-    # Per-frame OCR readings forwarded to Stage 7 temporal fusion AND used by
-    # main_pipeline.py to emit one CSV row per successful frame. Each entry
-    # is (formatted_text, conf, vehicle_bbox, plate_bbox_full, frame_idx) —
-    # text/conf already validated & formatted; only frames with plausible OCR
-    # text are included here.
-    frame_readings: tuple = ()
-    # NEW: every frame with a matched plate_bbox, regardless of OCR outcome
-    # — (vehicle_bbox, plate_bbox, frame_idx, ocr_text_or_empty, ocr_conf).
-    # Lets Stage 10 draw a box on every frame with a real detection, not
-    # only frames whose OCR happened to fully validate.
-    raw_detections: tuple = ()
+    job_id:                   str
+    track_id:                 int
+    plate_text:               str
+    confidence:               float
+    status:                   RecognitionStatus
+    plate_bbox:               Optional[BBox] = None
+    best_crop_path:           str = ""
+    # Per-frame OCR readings forwarded to Stage 7 temporal fusion:
+    # tuple of (formatted_text, conf, vehicle_bbox, plate_bbox_full, frame_idx)
+    frame_readings:           tuple = ()
+    # Specific per-branch readings for side-by-side comparison:
+    frame_readings_bilateral: tuple = ()
+    frame_readings_adaptive:  tuple = ()
+    # Raw bounding boxes for Stage 10 video rendering
+    raw_detections:           tuple = ()
+    winner_branch:            str = "none"
 
 
 @dataclass
@@ -194,20 +195,24 @@ class Worker(threading.Thread):
     def _process(self, job) -> RecognitionResult:
         """
         For each selected frame:
-          1. Skip the frame outright if its vehicle crop is too blurry to be
-             worth an OCR call (Slide 5/17 commitment).
-          2. Use the plate_bbox Stage 3 already matched (full-frame coords)
-             — no detection happens here anymore.
-          3. Crop it out of the stored ROI, enhance it (CLAHE + sharpen +
-             upscale), OCR it with strict format validation + correction.
-          4. Record it in raw_detections (always, if a plate_bbox existed)
-             and in frame_readings (only if OCR produced plausible text).
+          1. Skip if vehicle crop is too blurry.
+          2. Use plate_bbox already matched in Stage 3.
+          3. Crop plate and apply geometric perspective deskewing.
+          4. Parallely execute Branch A (Bilateral) and Branch B (Adaptive Contrast).
+          5. Save both enhanced crops (_plate_bilateral.png & _plate_adaptive.png)
+             and the context image with comparison overlay.
+          6. Run OCR on both and record comparative performance.
         """
         best_text  = ""
         best_conf  = 0.0
         best_bbox: Optional[BBox] = None
         frame_readings: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
+        readings_bilateral: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
+        readings_adaptive: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
         raw_detections: List[Tuple[BBox, Optional[BBox], int, str, float]] = []
+
+        bilateral_wins = 0
+        adaptive_wins = 0
 
         for frame_entry in job.selected_frames:
 
@@ -226,24 +231,58 @@ class Worker(threading.Thread):
                 DIAG.bump("crop_empty")
                 continue
 
-            # Empty bumper / smooth surface filter: real plates have character strokes (edges)
             if plate_edge_density(plate_crop) < 0.02:
                 DIAG.bump("crop_empty")
                 continue
 
-            # Commenting out old enhancement method as requested
-            # plate_ready = enhance_plate_crop(plate_crop, upscale_factor=self.cfg.upscale_factor)
-            plate_ready = enhance_plate_crop_bilateral(plate_crop, upscale_factor=self.cfg.upscale_factor)
+            # 1. Perspective Deskewing
+            plate_deskewed = deskew_plate_crop(plate_crop)
 
-            text, conf = self._run_ocr_validated(
-                plate_ready, tag=f"t{job.track_id}_f{frame_entry.frame_idx}"
+            # 2. Parallel Preprocessing Branches
+            plate_bilateral = enhance_plate_crop_bilateral(
+                plate_deskewed, upscale_factor=self.cfg.upscale_factor
+            )
+            plate_adaptive = enhance_plate_crop_adaptive(
+                plate_deskewed, upscale_factor=self.cfg.upscale_factor
             )
 
+            # 3. Parallel OCR Recognition
+            tag_b = f"t{job.track_id}_f{frame_entry.frame_idx}_bilateral"
+            tag_a = f"t{job.track_id}_f{frame_entry.frame_idx}_adaptive"
+            text_b, conf_b = self._run_ocr_validated(plate_bilateral, tag=tag_b)
+            text_a, conf_a = self._run_ocr_validated(plate_adaptive, tag=tag_a)
+
+            if text_b:
+                DIAG.bump("ocr_forwarded_bilateral")
+                readings_bilateral.append(
+                    (text_b, conf_b, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
+                )
+            if text_a:
+                DIAG.bump("ocr_forwarded_adaptive")
+                readings_adaptive.append(
+                    (text_a, conf_a, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
+                )
+
+            # Select best candidate for frame
+            if conf_b >= conf_a and text_b:
+                frame_text, frame_conf = text_b, conf_b
+                bilateral_wins += 1
+            elif text_a:
+                frame_text, frame_conf = text_a, conf_a
+                adaptive_wins += 1
+            elif text_b:
+                frame_text, frame_conf = text_b, conf_b
+                bilateral_wins += 1
+            else:
+                frame_text, frame_conf = "", 0.0
+
+            # 4. Save both enhanced crops and comparison context image
             if self.cfg.save_crops and self.cfg.crops_dir:
                 try:
                     os.makedirs(self.cfg.crops_dir, exist_ok=True)
                     prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
-                    cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate.png"), plate_ready)
+                    cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate_bilateral.png"), plate_bilateral)
+                    cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate_adaptive.png"), plate_adaptive)
 
                     roi = frame_entry.full_frame
                     if roi is not None and roi.size > 0:
@@ -255,51 +294,53 @@ class Worker(threading.Thread):
                         lx2 = min(context_img.shape[1], px2 - ox)
                         ly2 = min(context_img.shape[0], py2 - oy)
                         cv2.rectangle(context_img, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
-                        label = f"{text} ({conf:.2f})" if text else "No Text"
-                        cv2.putText(context_img, label, (lx1, max(15, ly1 - 6)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                        
+                        # Comparison Label Overlay
+                        lbl_b = f"Bilateral: {text_b} ({conf_b:.2f})" if text_b else "Bilateral: --"
+                        lbl_a = f"Adaptive:  {text_a} ({conf_a:.2f})" if text_a else "Adaptive:  --"
+                        cv2.putText(context_img, lbl_b, (lx1, max(18, ly1 - 18)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+                        cv2.putText(context_img, lbl_a, (lx1, max(32, ly1 - 4)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
                         cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_context.png"), context_img)
                 except Exception as exc:
                     logger.debug("Failed saving crop image: %s", exc)
 
             raw_detections.append((
                 frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx,
-                text, conf,
+                frame_text, frame_conf,
             ))
 
-            if text:
+            if frame_text:
                 frame_readings.append(
-                    (text, conf, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
+                    (frame_text, frame_conf, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
                 )
-                if conf > best_conf:
-                    best_conf = conf
-                    best_text = text
+                if frame_conf > best_conf:
+                    best_conf = frame_conf
+                    best_text = frame_text
                     best_bbox = frame_entry.plate_bbox
 
         status = RecognitionStatus.SUCCESS if best_text else RecognitionStatus.NO_PLATE
+        winner = "bilateral" if bilateral_wins > adaptive_wins else ("adaptive" if adaptive_wins > bilateral_wins else ("tie" if bilateral_wins > 0 else "none"))
 
         return RecognitionResult(
-            job_id         = job.job_id,
-            track_id       = job.track_id,
-            plate_text     = best_text,
-            confidence     = best_conf,
-            status         = status,
-            plate_bbox     = best_bbox,
-            frame_readings = tuple(frame_readings),
-            raw_detections = tuple(raw_detections),
+            job_id                   = job.job_id,
+            track_id                 = job.track_id,
+            plate_text               = best_text,
+            confidence               = best_conf,
+            status                   = status,
+            plate_bbox               = best_bbox,
+            frame_readings           = tuple(frame_readings),
+            frame_readings_bilateral = tuple(readings_bilateral),
+            frame_readings_adaptive  = tuple(readings_adaptive),
+            raw_detections           = tuple(raw_detections),
+            winner_branch            = winner,
         )
 
     # ── Cropping (no detection — plate_bbox is already known) ─────────────────
 
     @staticmethod
     def _crop_plate(frame_entry) -> Optional[np.ndarray]:
-        """
-        plate_bbox is in FULL-FRAME coordinates (set by Stage 3 from Stage
-        2.5's full-frame detection). frame_entry.full_frame is the padded
-        ROI stored for this frame, offset by frame_entry.roi_offset — so we
-        translate plate_bbox into ROI-local coordinates once, here, and
-        nowhere else in the pipeline.
-        """
         roi = frame_entry.full_frame
         if roi is None or roi.size == 0:
             return None
@@ -322,7 +363,7 @@ class Worker(threading.Thread):
 
         return roi[ly1:ly2, lx1:lx2].copy()
 
-    # ── OCR with strict validation ─────────────────────────────────────────────
+    # ── OCR with strict validation & Dual-Pass Whitelisting ────────────────────
 
     _MIN_PLATE_LEN = 8
     _MAX_PLATE_LEN = 10
@@ -331,10 +372,10 @@ class Worker(threading.Thread):
         """
         Iterates EasyOCR detections and supports:
         1. Single-line plate candidate extraction and correction.
-        2. Multi-line / vertically stacked candidate merging (e.g., 2-line Indian plates
-           where the state/RTO code is on top and series/registration number is below).
-        3. Automatic stripping of accidental 'IND' country identifier holograms.
-        4. Soft positional heuristic formatting for Indian vehicle layout.
+        2. Multi-line / vertically stacked candidate merging (e.g., 2-line Indian plates).
+        3. Dual-pass region split OCR (Left: State+Series, Right: 4-digit registration number).
+        4. Automatic stripping of accidental 'IND' country identifier holograms.
+        5. Soft positional heuristic formatting for Indian vehicle layout.
         """
         detections = self.ocr.readtext(
             plate_img,
@@ -347,59 +388,87 @@ class Worker(threading.Thread):
             allowlist       = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
         )
 
-        if not detections:
-            DIAG.bump("ocr_empty")
-            _debug_save("ocr_empty", plate_img, tag=tag)
-            return "", 0.0
-
         plausible: List[Tuple[str, float]] = []
         raw_seen: List[str] = []
 
-        # 1. Single detection candidates
-        for (_bbox, text, conf) in detections:
-            clean = clean_ocr_text(text)
-            if not clean:
-                continue
-
-            # Strip leading 'IND' if accidentally included in a long string (e.g. INDKA01AB1234)
-            if clean.startswith("IND") and len(clean) > 10:
-                clean = clean[3:]
-
-            corrected = soft_format_indian_plate(clean)
-            raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
-
-            if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
-                plausible.append((corrected, float(conf)))
-
-        # 2. Multi-line / vertically stacked detection merging (for 2-line plates)
-        if len(detections) >= 2:
-            # Sort boxes vertically from top to bottom
-            sorted_dets = sorted(detections, key=lambda d: min(p[1] for p in d[0]))
-            clean_parts = []
-            confs = []
-            for (_bbox, text, conf) in sorted_dets:
-                c = clean_ocr_text(text)
-                if not c:
+        if detections:
+            # 1. Single detection candidates
+            for (_bbox, text, conf) in detections:
+                clean = clean_ocr_text(text)
+                if not clean:
                     continue
-                # Ignore isolated 'IND' country stamp
-                if c == "IND":
-                    continue
-                if c.startswith("IND") and len(c) > 4:
-                    c = c[3:]
-                clean_parts.append(c)
-                confs.append(float(conf))
 
-            if len(clean_parts) >= 2:
-                merged_text = "".join(clean_parts)
-                if merged_text.startswith("IND") and len(merged_text) > 10:
-                    merged_text = merged_text[3:]
+                if clean.startswith("IND") and len(clean) > 10:
+                    clean = clean[3:]
 
-                corrected_merged = soft_format_indian_plate(merged_text)
-                merged_conf = float(sum(confs) / len(confs)) if confs else 0.0
-                raw_seen.append(f"stacked[{'+'.join(clean_parts)}]->'{corrected_merged}'(conf={merged_conf:.2f})")
+                corrected = soft_format_indian_plate(clean)
+                raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
 
-                if self._MIN_PLATE_LEN <= len(corrected_merged) <= self._MAX_PLATE_LEN:
-                    plausible.append((corrected_merged, merged_conf))
+                if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
+                    plausible.append((corrected, float(conf)))
+
+            # 2. Multi-line / vertically stacked detection merging (for 2-line plates)
+            if len(detections) >= 2:
+                sorted_dets = sorted(detections, key=lambda d: min(p[1] for p in d[0]))
+                clean_parts = []
+                confs = []
+                for (_bbox, text, conf) in sorted_dets:
+                    c = clean_ocr_text(text)
+                    if not c or c == "IND":
+                        continue
+                    if c.startswith("IND") and len(c) > 4:
+                        c = c[3:]
+                    clean_parts.append(c)
+                    confs.append(float(conf))
+
+                if len(clean_parts) >= 2:
+                    merged_text = "".join(clean_parts)
+                    if merged_text.startswith("IND") and len(merged_text) > 10:
+                        merged_text = merged_text[3:]
+
+                    corrected_merged = soft_format_indian_plate(merged_text)
+                    merged_conf = float(sum(confs) / len(confs)) if confs else 0.0
+                    raw_seen.append(f"stacked[{'+'.join(clean_parts)}]->'{corrected_merged}'(conf={merged_conf:.2f})")
+
+                    if self._MIN_PLATE_LEN <= len(corrected_merged) <= self._MAX_PLATE_LEN:
+                        plausible.append((corrected_merged, merged_conf))
+
+        # 3. Dual-Pass Region Split (for wide single-line plates)
+        h, w = plate_img.shape[:2]
+        if w / float(max(1, h)) >= 2.2:
+            try:
+                left_crop = plate_img[:, :int(w * 0.58)]
+                right_crop = plate_img[:, int(w * 0.48):]
+
+                left_res = self.ocr.readtext(
+                    left_crop,
+                    detail=1,
+                    paragraph=False,
+                    allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
+                )
+                right_res = self.ocr.readtext(
+                    right_crop,
+                    detail=1,
+                    paragraph=False,
+                    allowlist="0123456789",  # Strict numeric for registration digits
+                )
+
+                if left_res and right_res:
+                    l_text = clean_ocr_text("".join(d[1] for d in left_res))
+                    r_text = clean_ocr_text("".join(d[1] for d in right_res))
+                    if l_text.startswith("IND") and len(l_text) > 4:
+                        l_text = l_text[3:]
+
+                    split_combined = l_text + r_text
+                    if self._MIN_PLATE_LEN <= len(split_combined) <= self._MAX_PLATE_LEN:
+                        l_conf = sum(d[2] for d in left_res) / len(left_res)
+                        r_conf = sum(d[2] for d in right_res) / len(right_res)
+                        split_conf = float((l_conf + r_conf) / 2.0)
+                        corrected_split = soft_format_indian_plate(split_combined)
+                        raw_seen.append(f"split[{l_text}+{r_text}]->'{corrected_split}'(conf={split_conf:.2f})")
+                        plausible.append((corrected_split, split_conf))
+            except Exception:
+                pass
 
         if plausible:
             DIAG.bump("ocr_forwarded_plausible")

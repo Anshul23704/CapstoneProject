@@ -176,6 +176,35 @@ Baseline Run (0 Plates) ──► Teammate Merge ──► Run 1 (319 Cars / 2 P
 * Track 830: **`KA04OS1206`** (Conf: 0.2263 across 16 readings)
 * Track 847: **`KA01MN1413`** (Conf: 0.3814)
 
+### Phase 7: State Code Dictionary, Dual-Branch Preprocessing (Bilateral vs Adaptive), Perspective Deskewing & Stage 8 Trajectory Stitching (2026-08-23)
+
+#### Key Architectural Changes:
+1. **Parallel Preprocessing Evaluation (Bilateral vs Adaptive Thresholding):**
+   * **Branch A (Bilateral):** Grayscale $\rightarrow$ Bilateral Filter ($d=11$) $\rightarrow$ Lanczos4 upscale.
+   * **Branch B (Adaptive Contrast):** Grayscale $\rightarrow$ Morphological Top-Hat/Black-Hat Filter $\rightarrow$ CLAHE $\rightarrow$ Lanczos4 upscale.
+   * Saved both enhanced image variants to disk (`_plate_bilateral.png` & `_plate_adaptive.png`) and the context comparison overlay (`_context.png`).
+   * Evaluated side-by-side performance in `results_preprocessing_comparison.csv` and `analytics_*.png`.
+2. **Indian State Code Dictionary & Fuzzy Snapping:**
+   * Canonical 36 Indian State/UT abbreviations with Levenshtein $\le 1$ snapping (`TZ` $\rightarrow$ `TS`, `OA` $\rightarrow$ `AP`, `VA` $\rightarrow$ `KA`, `LZ` $\rightarrow$ `KL`).
+3. **Geometric Perspective Deskewing:**
+   * Homography / affine rectification on oblique plate crops before enhancement.
+4. **Dual-Pass Region-Split OCR Whitelisting:**
+   * Single-line plates split into left region (alphanumeric) and right region (strict numeric digits `0123456789`).
+5. **Stage 8 Plate-Guided Trajectory Stitching:**
+   * Stitches fragmented tracks sharing the same license plate within 300 frames.
+
+#### Pipeline Run Comparison:
+
+| Metric | Phase 4 (Baseline) | Phase 6 (Coord Scale + 2-Line OCR) | Phase 7 (Dual Preprocessing + Stitching) |
+| :--- | :--- | :--- | :--- |
+| **Ingestion Resolution** | $1280 \times 960$ (downsampled) | Native $2592 \times 1944$ | Native $2592 \times 1944$ |
+| **Plate Detection Boxes** | 52 | 759 | 759 |
+| **Valid Fused Plates** | 1 | 33 | **37** (3.7x baseline) |
+| **Unique Recognized Plates** | 1 | 29 | **30** |
+| **Stitched Track Segments** | 0 | 0 | **11** unified tracks |
+| **Interpolated CSV Rows** | 0 | 1,113 | **2,455** (2.2x increase) |
+| **Preprocessing Comparison** | Single method | Single method | **Bilateral (246 reads) vs Adaptive (245 reads)** |
+
 ---
 
 ## 3. Comprehensive Stage Audit & Current File Map
@@ -183,39 +212,17 @@ Baseline Run (0 Plates) ──► Teammate Merge ──► Run 1 (319 Cars / 2 P
 | File Path | Primary Responsibility | Key Recent Edits |
 | :--- | :--- | :--- |
 | `config.py` | Centralized paths, thresholds, devices | `PLATE_CONF_THRESHOLD=0.30`, `MIN_ASPECT_RATIO=1.10`, `TRACK_BUFFER=90`, `BUFFER_TIMEOUT=90`, `TRACK_MATCH=0.45` |
-| `plate_utils.py` | Positional heuristics, geometry, filters | `plate_edge_density`, `INTER_LANCZOS4`, `enhance_plate_crop_bilateral`, `soft_format_indian_plate` |
+| `plate_utils.py` | Positional heuristics, geometry, filters | `INDIAN_STATE_CODES`, `fuzzy_match_state_code`, `deskew_plate_crop`, `enhance_plate_crop_adaptive`, `enhance_plate_crop_bilateral` |
 | `stage2_detection_tracking.py` | Vehicle detection & ByteTrack | Inverse coordinate scaling (`orig_w, orig_h`), `VEHICLE_CLASS_IDS={2}` |
 | `plate_detection.py` | Stage 2.5 full-frame plate detector | Aspect ratio filtering $[1.10, 5.5]$, native frame processing |
 | `stage3_active_buffering.py` | Trajectory buffer & IoA association | 90-frame timeout synchronization, IoA matching |
 | `stage4_vehicle_finalization.py` | Quality checks & track closure | Drops short tracks ($<3$ frames) |
 | `stage5_job_creation.py` | Frame selection for OCR workers | Combined $\text{Area} \times \text{Sharpness}$ ranking |
-| `stage6_worker_pool.py` | Image enhancement, OCR, crop export | 2-line vertically stacked EasyOCR merging, `IND` hologram filtering, crop export |
-| `stage7_temporal_fusion.py` | Multi-frame character voting | Modal length alignment, voting without hard rejection |
-| `stage8_database_analytics.py` | SQLite DB logging & summary plots | Logs `ocr_results` with tracking metadata |
-| `stage9_interpolation.py` | Bounding box smoothing | Interpolates validated vehicle detections |
+| `stage6_worker_pool.py` | Image enhancement, OCR, crop export | Dual-branch preprocessing (Bilateral vs Adaptive), deskewing, dual-pass region split OCR, multi-line merge, crop export |
+| `stage7_temporal_fusion.py` | Multi-frame character voting | Positional prior glyph normalization during voting, state code snapping |
+| `stage8_database_analytics.py` | SQLite DB logging & trajectory stitcher | Post-tracking trajectory stitcher (`stitch_fragmented_rows`), side-by-side preprocessing comparison charts & CSV |
+| `stage9_interpolation.py` | Bounding box smoothing | Interpolates unified stitched vehicle trajectories |
 | `stage10_visualize.py` | Annotated video creation | Renders bounding boxes from `results_raw_detections.csv` |
-| `main_pipeline.py` | Threading orchestrator & CSV writer | Native resolution (`target_resolution=None`), raw detection streaming |
+| `main_pipeline.py` | Threading orchestrator & CSV writer | Post-processing trajectory stitching, dual branch metrics aggregation |
 
----
-
-## 4. Suggested Future Enhancements
-
-These are recommended optimizations that can be selectively enabled in future iterations:
-
-### Suggested Change 1: State Code Dictionary Fuzzy Match
-* **Concept:** Match the first 2 letters against the 36 valid Indian State/UT abbreviations (`KA`, `MH`, `DL`, `TS`, `AP`, `TN`, `KL`, `HR`, `UP`, `MP`, `GJ`, `WB`, `RJ`, etc.) using Levenshtein edit distance:
-  * `ES` / `3S` $\rightarrow$ `TS`
-  * `FK` $\rightarrow$ `KA`
-  * `OO` $\rightarrow$ `OD` / `DL`
-
-### Suggested Change 2: Region-Split Dual-Pass OCR Whitelisting
-* **Concept:** Crop the plate into a left portion (alphabetic state + series) and right portion (numeric registration digits), and invoke EasyOCR with strict whitelists:
-  * Left: `allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ"`
-  * Right: `allowlist="0123456789"`
-
-### Suggested Change 3: Plate Perspective Deskewing
-* **Concept:** Use edge detection and contour fitting to compute an affine transform that rectifies angled plates horizontally before OCR.
-
-### Suggested Change 4: Fine-Tuned License Plate OCR (TrOCR / CRNN)
-* **Concept:** Replace or augment EasyOCR with a compact CRNN or Microsoft TrOCR fine-tuned specifically on Indian vehicle plate fonts (FE-Schrift / Mandated IND font).
 

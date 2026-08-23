@@ -19,7 +19,14 @@ from dataclasses import dataclass
 from typing import List, Tuple
 
 import config
-from plate_utils import format_license, license_complies_format
+from plate_utils import (
+    CHAR_TO_INT,
+    INT_TO_CHAR,
+    format_license,
+    license_complies_format,
+    soft_format_indian_plate,
+    fuzzy_match_state_code,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -36,9 +43,8 @@ class TemporalFusionStage:
     """
     Stage 7 — Temporal Fusion & Validation.
 
-    Combines multiple per-frame OCR readings (already formatted by Stage 6)
-    via confidence-weighted character-level majority voting, then
-    re-validates the fused string with license_complies_format.
+    Combines multiple per-frame OCR readings via confidence-weighted
+    character-level majority voting with positional priors and state code verification.
     """
 
     def __init__(self, config: FusionConfig = FusionConfig()) -> None:
@@ -62,36 +68,46 @@ class TemporalFusionStage:
         if not valid:
             return "", 0.0, False
 
-        # Single reading — just return.
+        # Single reading — apply soft format and return.
         if len(valid) < self.cfg.min_readings_for_fusion:
             text, conf = max(valid, key=lambda x: x[1])
-            is_valid   = True # Validation moved to final stage
-            logger.debug("TemporalFusion: single reading -> '%s' valid=%s", text, is_valid)
-            return text, conf, is_valid
+            formatted = soft_format_indian_plate(text)
+            return formatted, conf, True
 
-        # Align by modal length across ALL readings, as strict validation is moved to CSV stage.
+        # Align by modal length across ALL readings.
         lengths       = [len(t) for t, _ in valid]
         target_length = Counter(lengths).most_common(1)[0][0]
         aligned       = [(t, c) for t, c in valid if len(t) == target_length]
 
         if not aligned:
             text, conf = max(valid, key=lambda x: x[1])
-            return text, conf, True
+            return soft_format_indian_plate(text), conf, True
 
-        # Confidence-weighted character-level majority voting.
+        # Confidence-weighted character-level majority voting with positional canonicalization
         fused_chars: List[str] = []
         for i in range(target_length):
             vote_weight: dict = {}
+            is_alpha_slot = (i in (0, 1)) or (target_length == 10 and i in (4, 5))
+            is_digit_slot = (i in (2, 3) and target_length in (9, 10)) or (i >= target_length - 4)
+
             for text, conf in aligned:
                 ch = text[i]
+                # Canonicalize glyph based on positional prior
+                if is_alpha_slot:
+                    ch = INT_TO_CHAR.get(ch, ch)
+                elif is_digit_slot:
+                    ch = CHAR_TO_INT.get(ch, ch)
+
                 weight = conf
                 vote_weight[ch] = vote_weight.get(ch, 0.0) + weight
+
             winner = max(vote_weight, key=vote_weight.__getitem__)
             fused_chars.append(winner)
 
-        fused_text = "".join(fused_chars)
+        raw_fused = "".join(fused_chars)
+        fused_text = soft_format_indian_plate(raw_fused)
         avg_conf = sum(c for _, c in aligned) / len(aligned)
-        is_valid = True # Strict validation moved to final stage
+        is_valid = True
 
         logger.debug(
             "TemporalFusion: %d/%d aligned (len=%d) -> '%s' conf=%.3f valid=%s",

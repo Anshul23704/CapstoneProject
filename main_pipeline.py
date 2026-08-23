@@ -93,10 +93,20 @@ def _result_consumer(
 
         try:
             fused_text, fused_conf, is_valid = "", 0.0, False
+            fused_b, conf_b = "", 0.0
+            fused_a, conf_a = "", 0.0
 
             if result.status == RecognitionStatus.SUCCESS and result.frame_readings:
                 readings_for_fusion = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings]
                 fused_text, fused_conf, is_valid = fusion.process(readings_for_fusion)
+
+                if result.frame_readings_bilateral:
+                    r_b = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_bilateral]
+                    fused_b, conf_b, _ = fusion.process(r_b)
+
+                if result.frame_readings_adaptive:
+                    r_a = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_adaptive]
+                    fused_a, conf_a, _ = fusion.process(r_a)
 
                 db.insert_result(
                     run_id=run_id,
@@ -108,18 +118,12 @@ def _result_consumer(
                     is_valid=is_valid,
                     plate_bbox=result.plate_bbox,
                     num_readings=len(result.frame_readings),
+                    plate_text_bilateral=fused_b,
+                    conf_bilateral=conf_b,
+                    plate_text_adaptive=fused_a,
+                    conf_adaptive=conf_a,
+                    winner_branch=result.winner_branch,
                 )
-
-                # --- STRICT REGEX VALIDATION (DISABLED FOR TESTING) ---
-                # To re-enable strict Indian license plate format validation before outputting to CSV,
-                # uncomment the following lines and ensure `license_complies_format` is imported from plate_utils.
-                #
-                # from plate_utils import license_complies_format
-                # if is_valid and fused_text and not license_complies_format(fused_text):
-                #     logger.info("Plate rejected by strict validation in final stage: '%s'", fused_text)
-                #     is_valid = False
-                #     fused_text = ""
-                # --------------------------------------------------------
 
                 if is_valid and fused_text:
                     for (_t, _c, vehicle_bbox, plate_bbox_full, frame_idx) in result.frame_readings:
@@ -145,10 +149,11 @@ def _result_consumer(
                     status=result.status.name,
                     is_valid=False,
                     num_readings=len(result.frame_readings),
+                    winner_branch=result.winner_branch,
                 )
                 stats["no_plate"] += 1
 
-            # NEW: raw stream — every real detection, not just validated ones.
+            # Raw stream — every real detection, not just validated ones.
             for (vehicle_bbox, plate_bbox_full, frame_idx, ocr_text, ocr_conf) in result.raw_detections:
                 if plate_bbox_full is None:
                     continue
@@ -271,16 +276,32 @@ def run() -> None:
         finalized_count, stats["fused_success"], stats["no_plate"],
     )
 
+    # ── Stage 8 Post-Processing: Plate-Guided Trajectory Stitching ──────────
+    stitched_rows, alias_map = DatabaseAnalyticsStage.stitch_fragmented_rows(rows, max_frame_gap=300)
+    if alias_map:
+        logger.info("Stitched %d fragmented track segments: %s", len(alias_map), alias_map)
+        # Apply alias map to raw_rows so video and visualizers show unified vehicle IDs
+        stitched_raw_rows = []
+        for r in raw_rows:
+            r_copy = dict(r)
+            tid = int(float(r_copy["car_id"]))
+            if tid in alias_map:
+                r_copy["car_id"] = alias_map[tid]
+            stitched_raw_rows.append(r_copy)
+        raw_rows = stitched_raw_rows
+    else:
+        stitched_rows = rows
+
     # ── Write rich CSV (fully-validated fused plates only) ──────────────────
-    rows.sort(key=lambda r: (r["frame_nmr"], r["car_id"]))
+    stitched_rows.sort(key=lambda r: (int(r["frame_nmr"]), int(float(r["car_id"]))))
     with open(RICH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
         writer.writeheader()
-        writer.writerows(rows)
-    logger.info("Rich CSV saved -> %s", RICH_CSV_PATH)
+        writer.writerows(stitched_rows)
+    logger.info("Rich CSV saved -> %s (%d rows)", RICH_CSV_PATH, len(stitched_rows))
 
     # ── Write raw detections CSV (every real detection, any track) ──────────
-    raw_rows.sort(key=lambda r: (r["frame_nmr"], r["car_id"]))
+    raw_rows.sort(key=lambda r: (int(r["frame_nmr"]), int(float(r["car_id"]))))
     with open(RAW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
         writer.writeheader()
