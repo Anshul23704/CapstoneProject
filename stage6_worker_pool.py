@@ -35,6 +35,7 @@ from enum import Enum, auto
 from queue import Queue
 from typing import List, Optional, Tuple
 
+import os
 import cv2
 import easyocr
 import numpy as np
@@ -43,9 +44,11 @@ import config
 from plate_utils import (
     clean_ocr_text,
     enhance_plate_crop,
+    enhance_plate_crop_bilateral,
     laplacian_sharpness,
     license_complies_format,
     format_license,
+    soft_format_indian_plate,
 )
 
 logger = logging.getLogger(__name__)
@@ -151,6 +154,8 @@ class WorkerConfig:
     use_gpu:          bool  = (config.DEVICE == "cuda")
     upscale_factor:   float = config.PLATE_UPSCALE_FACTOR
     blur_threshold:   float = config.BLUR_THRESHOLD
+    save_crops:       bool  = True
+    crops_dir:        Optional[str] = None
 
 
 class Worker(threading.Thread):
@@ -220,11 +225,36 @@ class Worker(threading.Thread):
                 DIAG.bump("crop_empty")
                 continue
 
-            plate_ready = enhance_plate_crop(plate_crop, upscale_factor=self.cfg.upscale_factor)
+            # Commenting out old enhancement method as requested
+            # plate_ready = enhance_plate_crop(plate_crop, upscale_factor=self.cfg.upscale_factor)
+            plate_ready = enhance_plate_crop_bilateral(plate_crop, upscale_factor=self.cfg.upscale_factor)
 
             text, conf = self._run_ocr_validated(
                 plate_ready, tag=f"t{job.track_id}_f{frame_entry.frame_idx}"
             )
+
+            if self.cfg.save_crops and self.cfg.crops_dir:
+                try:
+                    os.makedirs(self.cfg.crops_dir, exist_ok=True)
+                    prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
+                    cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate.png"), plate_ready)
+
+                    roi = frame_entry.full_frame
+                    if roi is not None and roi.size > 0:
+                        context_img = roi.copy()
+                        ox, oy = frame_entry.roi_offset
+                        px1, py1, px2, py2 = frame_entry.plate_bbox
+                        lx1 = max(0, px1 - ox)
+                        ly1 = max(0, py1 - oy)
+                        lx2 = min(context_img.shape[1], px2 - ox)
+                        ly2 = min(context_img.shape[0], py2 - oy)
+                        cv2.rectangle(context_img, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
+                        label = f"{text} ({conf:.2f})" if text else "No Text"
+                        cv2.putText(context_img, label, (lx1, max(15, ly1 - 6)),
+                                    cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 0), 1, cv2.LINE_AA)
+                        cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_context.png"), context_img)
+                except Exception as exc:
+                    logger.debug("Failed saving crop image: %s", exc)
 
             raw_detections.append((
                 frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx,
@@ -324,14 +354,11 @@ class Worker(threading.Thread):
             clean = clean_ocr_text(text)
             if not clean:
                 continue
-            corrected = format_license(clean)
-            raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
 
-            if license_complies_format(corrected):
-                logger.debug("OCR accepted (fully valid): '%s' -> '%s' conf=%.3f",
-                              clean, corrected, conf)
-                DIAG.bump("ocr_format_passed")
-                return corrected, float(conf)
+            # Soft positional correction: replaces characters based on Indian plate
+            # layout heuristics without ever discarding or rejecting the string.
+            corrected = soft_format_indian_plate(clean)
+            raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
 
             if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
                 plausible.append((corrected, float(conf)))
@@ -340,7 +367,7 @@ class Worker(threading.Thread):
             DIAG.bump("ocr_forwarded_plausible")
             best_text, best_conf = max(plausible, key=lambda x: x[1])
             logger.debug(
-                "OCR forwarded (length-plausible, not independently valid): '%s' conf=%.3f",
+                "OCR forwarded (soft-corrected): '%s' conf=%.3f",
                 best_text, best_conf,
             )
             return best_text, best_conf

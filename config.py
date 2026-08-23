@@ -20,33 +20,46 @@ import os
 
 try:
     import torch
-    _CUDA_AVAILABLE = torch.cuda.is_available()
+    if torch.cuda.is_available():
+        DEVICE = "cuda"
+    elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+        DEVICE = "mps"
+    else:
+        DEVICE = "cpu"
 except Exception:
-    _CUDA_AVAILABLE = False
+    DEVICE = "cpu"
 
-DEVICE = "cuda" if _CUDA_AVAILABLE else "cpu"
+PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 
-PROJECT_ROOT = r"E:\Capstone\CapstoneProject-main\implementation"
+MODEL_DIR = os.path.join(PROJECT_ROOT, "models")
 
-MODEL_DIR = r"E:\Capstone\CapstoneProject-main\implementation\models"
+VEHICLE_MODEL_PATH = os.getenv("VEHICLE_MODEL_PATH", "yolov8s.pt")
 
-VEHICLE_MODEL_PATH = os.path.join(MODEL_DIR, "yolo26s.pt")
+PLATE_MODEL_PATH = os.getenv(
+    "PLATE_MODEL_PATH",
+    os.path.join(MODEL_DIR, "license_plate_yolo26m-3", "weights", "best.pt")
+    if os.path.exists(os.path.join(MODEL_DIR, "license_plate_yolo26m-3", "weights", "best.pt"))
+    else os.path.join(MODEL_DIR, "best.pt")
+)
 
-PLATE_MODEL_PATH = os.path.join(MODEL_DIR, "best.pt")
+VIDEO_SOURCE = os.getenv(
+    "VIDEO_SOURCE",
+    os.path.join(PROJECT_ROOT, "dataset", "test2.mp4")
+)
 
-VIDEO_SOURCE = r"E:\Capstone\CapstoneProject-main\implementation\input\test.mp4"
-
-OUTPUT_ROOT = r"E:\Capstone\CapstoneProject-main\implementation\output"
+OUTPUT_ROOT = os.getenv(
+    "OUTPUT_ROOT",
+    os.path.join(PROJECT_ROOT, "output")
+)
 
 # ── Vehicle classes (COCO ids) ────────────────────────────────────────────────
-# Slide 14 ("Stage 2 — Detection & Tracking") says "cars only" / "filter out
-# irrelevant classes (people, bikes, trucks etc.)" in the summary bullet, but
-# the scope (Slide 4) targets toll/parking/enforcement which all need buses
-# and trucks too, and the original code already tracked bus+truck. We keep
-# car/bus/truck and explicitly drop motorcycle — main_pipeline.py previously
-# included motorcycle (class 3) in VEHICLE_CLASSES while stage2 did not; that
-# silent mismatch is fixed by having both read from here.
-VEHICLE_CLASS_IDS = {2, 5, 7}   # car, bus, truck
+# ==============================================================================
+# REMINDER: Currently configured to track CARS ONLY (COCO class 2).
+# If you ever want to re-enable buses and trucks in the future, change this back to:
+# VEHICLE_CLASS_IDS = {2, 5, 7}   # 2: car, 5: bus, 7: truck
+# (Motorcycle is COCO class 3)
+# ==============================================================================
+VEHICLE_CLASS_IDS = {2}   # CARS ONLY
 
 # ── Detection / tracking ──────────────────────────────────────────────────────
 DETECTION_CONF_THRESHOLD = 0.25
@@ -57,10 +70,11 @@ TRACK_BUFFER            = 50
 TRACK_MATCH_THRESHOLD   = 0.60
 
 # ── Buffering (Stage 3) ───────────────────────────────────────────────────────
-BUFFER_MAX_SIZE       = 20     # max frames kept per vehicle
-BUFFER_TIMEOUT_FRAMES  = 30     # frames-since-seen before timeout finalize
-BUFFER_FORCE_FINALIZE_AT = 20   # force finalize once this many frames collected
-ROI_PAD = 80                    # px padding around vehicle bbox for the stored ROI
+# Unlimited buffering: a vehicle keeps all its frames until it leaves the scene.
+BUFFER_MAX_SIZE          = None   # None = keep all frames (no sliding window pop)
+BUFFER_TIMEOUT_FRAMES    = 30     # frames-since-seen before timeout finalize
+BUFFER_FORCE_FINALIZE_AT = None   # None = do not force finalize; let vehicle track complete naturally
+ROI_PAD                  = 80     # px padding around vehicle bbox for the stored ROI
 
 # ── Finalization (Stage 4) ────────────────────────────────────────────────────
 # Slide 16: "Ensure minimum frame count for reliable processing". Abstract

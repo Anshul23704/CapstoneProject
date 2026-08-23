@@ -110,6 +110,17 @@ def _result_consumer(
                     num_readings=len(result.frame_readings),
                 )
 
+                # --- STRICT REGEX VALIDATION (DISABLED FOR TESTING) ---
+                # To re-enable strict Indian license plate format validation before outputting to CSV,
+                # uncomment the following lines and ensure `license_complies_format` is imported from plate_utils.
+                #
+                # from plate_utils import license_complies_format
+                # if is_valid and fused_text and not license_complies_format(fused_text):
+                #     logger.info("Plate rejected by strict validation in final stage: '%s'", fused_text)
+                #     is_valid = False
+                #     fused_text = ""
+                # --------------------------------------------------------
+
                 if is_valid and fused_text:
                     for (_t, _c, vehicle_bbox, plate_bbox_full, frame_idx) in result.frame_readings:
                         if plate_bbox_full is None:
@@ -172,9 +183,12 @@ def run() -> None:
     result_queue:     Queue = Queue()
 
     job_creator = JobCreationStage(processing_queue, JobCreationConfig())
+    crops_dir   = os.path.join(OUTPUT_DIR, "plate_crops")
+    os.makedirs(crops_dir, exist_ok=True)
     worker_pool = WorkerPoolStage(
         processing_queue, result_queue,
-        num_workers=config.NUM_WORKERS, config=WorkerConfig(),
+        num_workers=config.NUM_WORKERS,
+        config=WorkerConfig(save_crops=True, crops_dir=crops_dir),
     )
     fusion = TemporalFusionStage(FusionConfig())
     db     = DatabaseAnalyticsStage(DatabaseConfig(db_path=DB_PATH))

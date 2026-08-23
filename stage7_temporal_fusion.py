@@ -62,68 +62,36 @@ class TemporalFusionStage:
         if not valid:
             return "", 0.0, False
 
-        # Single reading — just re-validate and return.
+        # Single reading — just return.
         if len(valid) < self.cfg.min_readings_for_fusion:
             text, conf = max(valid, key=lambda x: x[1])
-            # FIX: format_license now handles Indian plates' variable-length
-            # series segment internally (see plate_utils.py) and is a no-op
-            # for text it can't correct, so the old `if len(text) == 7`
-            # gate — a leftover from the previous 7-char-only format — is
-            # both unnecessary and wrong (it silently skipped correction on
-            # every real 9-10 char Indian plate read).
-            text       = format_license(text)
-            is_valid   = license_complies_format(text)
+            is_valid   = True # Validation moved to final stage
             logger.debug("TemporalFusion: single reading -> '%s' valid=%s", text, is_valid)
             return text, conf, is_valid
 
-        # Align by modal length. FIX: prefer the modal length among readings
-        # that already independently pass full format validation (the most
-        # trustworthy signal of the plate's *true* length) over the modal
-        # length across ALL readings — a few frames with the leading digit
-        # of the plate number OCR'd away (length off by one) shouldn't be
-        # allowed to outvote frames that read the plate completely.
-        already_valid = [(t, c) for t, c in valid if license_complies_format(t)]
-        length_source = already_valid if already_valid else valid
-        lengths       = [len(t) for t, _ in length_source]
+        # Align by modal length across ALL readings, as strict validation is moved to CSV stage.
+        lengths       = [len(t) for t, _ in valid]
         target_length = Counter(lengths).most_common(1)[0][0]
         aligned       = [(t, c) for t, c in valid if len(t) == target_length]
 
         if not aligned:
             text, conf = max(valid, key=lambda x: x[1])
-            text       = format_license(text)
-            return text, conf, license_complies_format(text)
+            return text, conf, True
 
-        # Confidence-weighted character-level majority voting. Readings
-        # that are already fully valid on their own get their vote weight
-        # boosted — they're a complete, self-consistent read rather than a
-        # partial/corrected guess, so they should dominate the vote at any
-        # position where they disagree with a partial reading.
-        _VALID_READ_BOOST = 2.0
+        # Confidence-weighted character-level majority voting.
         fused_chars: List[str] = []
         for i in range(target_length):
             vote_weight: dict = {}
             for text, conf in aligned:
                 ch = text[i]
-                weight = conf * (_VALID_READ_BOOST if license_complies_format(text) else 1.0)
+                weight = conf
                 vote_weight[ch] = vote_weight.get(ch, 0.0) + weight
             winner = max(vote_weight, key=vote_weight.__getitem__)
             fused_chars.append(winner)
 
         fused_text = "".join(fused_chars)
-
         avg_conf = sum(c for _, c in aligned) / len(aligned)
-
-        fused_text = format_license(fused_text)
-
-        is_valid = license_complies_format(fused_text)
-
-        # FIX: if character-voting still didn't converge on a valid plate,
-        # fall back to the single highest-confidence reading that was
-        # ALREADY fully valid on its own (if any exists) rather than
-        # returning a garbled fusion — one clean frame beats a noisy blend.
-        if not is_valid and already_valid:
-            fused_text, avg_conf = max(already_valid, key=lambda x: x[1])
-            is_valid = True
+        is_valid = True # Strict validation moved to final stage
 
         logger.debug(
             "TemporalFusion: %d/%d aligned (len=%d) -> '%s' conf=%.3f valid=%s",

@@ -3,4 +3,25 @@ input/
 output/
 models/
 debug_plate_crops/
+dataset/
 
+# Virtual Environment
+.venv/
+venv/
+env/
+ENV/
+
+# Python cache & bytecode
+__pycache__/
+*.py[cod]
+*$py.class
+
+# Model weights
+*.pt
+*.onnx
+*.engine
+
+# OS & Editor files
+.DS_Store
+.vscode/
+tempCodeRunnerFile.py

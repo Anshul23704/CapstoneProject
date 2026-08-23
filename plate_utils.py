@@ -25,8 +25,8 @@ import numpy as np
 BBox = Tuple[int, int, int, int]
 
 # ── OCR confusion tables ──────────────────────────────────────────────────────
-CHAR_TO_INT = {'O': '0', 'I': '1', 'J': '3', 'A': '4', 'G': '6', 'S': '5'}
-INT_TO_CHAR = {v: k for k, v in CHAR_TO_INT.items()}
+CHAR_TO_INT = {'O': '0', 'D': '0', 'Q': '0', 'I': '1', 'L': '1', 'Z': '2', 'J': '3', 'A': '4', 'S': '5', 'G': '6', 'B': '8'}
+INT_TO_CHAR = {'0': 'O', '1': 'I', '2': 'Z', '3': 'J', '4': 'A', '5': 'S', '6': 'G', '7': 'T', '8': 'B'}
 
 _ALPHA_OK = set(string.ascii_uppercase) | set(INT_TO_CHAR.keys())
 _DIGIT_OK = set('0123456789') | set(CHAR_TO_INT.keys())
@@ -95,6 +95,52 @@ def format_license(text: str) -> str:
     return text
 
 
+def soft_format_indian_plate(text: str) -> str:
+    """
+    Applies heuristic positional character correction without ever discarding
+    or rejecting the plate string.
+    - Position 0..1 (State Code): forces digits/confusions to letters.
+    - Position -4..end (Registration number): forces letters/confusions to digits.
+    - Position 2..3 (RTO code): forces letters/confusions to digits.
+    - Remaining middle characters (Series): forces digits/confusions to letters.
+    """
+    if not text or len(text) < 7:
+        return text
+
+    chars = list(text)
+    n = len(chars)
+
+    # 1. State code (First 2 characters -> Letters)
+    chars[0] = INT_TO_CHAR.get(chars[0], chars[0])
+    chars[1] = INT_TO_CHAR.get(chars[1], chars[1])
+
+    # 2. Last 4 characters (Registration number -> Digits)
+    for i in range(max(2, n - 4), n):
+        chars[i] = CHAR_TO_INT.get(chars[i], chars[i])
+
+    # 3. If standard 9 or 10 character plate:
+    if n in (9, 10):
+        # Position 2: RTO code first digit -> Digit
+        chars[2] = CHAR_TO_INT.get(chars[2], chars[2])
+        if n == 10:
+            # Position 3: RTO code second digit -> Digit
+            chars[3] = CHAR_TO_INT.get(chars[3], chars[3])
+            # Positions 4..5: Series -> Letters
+            for i in range(4, n - 4):
+                chars[i] = INT_TO_CHAR.get(chars[i], chars[i])
+        elif n == 9:
+            # 9-char format: either 2-digit RTO + 1-letter series, or 1-digit RTO + 2-letter series
+            if chars[3] in '0123456789' or chars[3] in CHAR_TO_INT:
+                chars[3] = CHAR_TO_INT.get(chars[3], chars[3])
+                for i in range(4, n - 4):
+                    chars[i] = INT_TO_CHAR.get(chars[i], chars[i])
+            else:
+                for i in range(3, n - 4):
+                    chars[i] = INT_TO_CHAR.get(chars[i], chars[i])
+
+    return "".join(chars)
+
+
 def clean_ocr_text(raw_text: str) -> str:
     return raw_text.upper().replace(" ", "").replace("-", "")
 
@@ -148,6 +194,35 @@ def enhance_plate_crop(
     sharpened = cv2.addWeighted(contrast_enhanced, 1.5, blurred, -0.5, 0)
 
     return cv2.cvtColor(sharpened, cv2.COLOR_GRAY2BGR)
+
+
+def enhance_plate_crop_bilateral(
+    plate_crop: np.ndarray,
+    upscale_factor: float = 2.0,
+    min_width: int = 120,
+    min_height: int = 30,
+) -> np.ndarray:
+    """
+    Grayscale + bilateral filter + upscaling, as requested to reduce noise before OCR.
+    """
+    if plate_crop is None or plate_crop.size == 0:
+        return plate_crop
+
+    h, w = plate_crop.shape[:2]
+    scale = max(upscale_factor, min_width / max(w, 1), min_height / max(h, 1))
+    if scale > 1.0:
+        plate_crop = cv2.resize(
+            plate_crop,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_CUBIC,
+        )
+
+    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+
+    # Bilateral filter to smooth noise while preserving edges
+    filtered = cv2.bilateralFilter(gray, d=11, sigmaColor=17, sigmaSpace=17)
+
+    return cv2.cvtColor(filtered, cv2.COLOR_GRAY2BGR)
 
 
 # ── Geometry ───────────────────────────────────────────────────────────────────
