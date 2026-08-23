@@ -143,3 +143,6 @@ NUM_WORKERS = 3     # matches "Worker Thread 1/2/3" in the architecture diagram
 
 # ── Temporal fusion (Stage 7) ─────────────────────────────────────────────────
 MIN_READINGS_FOR_FUSION = 2
+
+# ── Final Outputs Filtering ───────────────────────────────────────────────────
+FINAL_OUTPUT_CONF_THRESHOLD = 0.20  # Minimum confidence required for high-confidence final output table

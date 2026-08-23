@@ -314,6 +314,69 @@ def run() -> None:
         logger.info("Analytics -> %s", report_path)
     db.close()
 
+    # ── High-Confidence Final Outputs Export ──────────────────────────────────
+    final_outputs_csv = os.path.join(OUTPUT_DIR, "Final_outputs.csv")
+    final_outputs_md  = os.path.join(OUTPUT_DIR, "Final_outputs.md")
+    
+    # Calculate video FPS for timestamp calculation
+    try:
+        cap = cv2.VideoCapture(config.VIDEO_SOURCE)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+    except Exception:
+        fps = 30.0
+
+    # Group stitched detections by car_id to get highest confidence entry per vehicle
+    high_conf_outputs = []
+    if stitched_rows:
+        df_stitched = pd.DataFrame(stitched_rows)
+        for car_id, group in df_stitched.groupby("car_id"):
+            best_row = group.sort_values(by="license_number_score", ascending=False).iloc[0]
+            conf_val = float(best_row["license_number_score"])
+            if conf_val >= config.FINAL_OUTPUT_CONF_THRESHOLD:
+                f_idx = int(best_row["frame_nmr"])
+                plate_txt = str(best_row["license_number"])
+                sec = f_idx / fps
+                ts = f"{int(sec//3600):02d}:{int((sec%3600)//60):02d}:{sec%60:06.3f}"
+                
+                # Check for existing crop images
+                context_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
+                plate_b_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
+                plate_a_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
+                
+                high_conf_outputs.append({
+                    "Track_ID":                  int(car_id),
+                    "License_Plate":             plate_txt,
+                    "Confidence":                f"{conf_val:.4f}",
+                    "Timestamp":                 ts,
+                    "Frame_Number":              f_idx,
+                    "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
+                    "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
+                    "Plate_Adaptive_Path":       os.path.abspath(plate_a_f) if os.path.exists(plate_a_f) else plate_a_f,
+                })
+
+    high_conf_outputs.sort(key=lambda x: (x["Frame_Number"], x["Track_ID"]))
+
+    # Write Final_outputs.csv
+    if high_conf_outputs:
+        with open(final_outputs_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(high_conf_outputs[0].keys()))
+            writer.writeheader()
+            writer.writerows(high_conf_outputs)
+        logger.info("High-confidence Final Outputs CSV saved -> %s (%d vehicles)", final_outputs_csv, len(high_conf_outputs))
+
+        # Write easy-to-read Final_outputs.md
+        with open(final_outputs_md, "w", encoding="utf-8") as f:
+            f.write(f"# High-Confidence License Plate Outputs — Run {RUN_ID}\n\n")
+            f.write(f"**Confidence Threshold:** $\\ge {config.FINAL_OUTPUT_CONF_THRESHOLD:.2f}$ | **Total Verified Vehicles:** {len(high_conf_outputs)}\n\n")
+            f.write("| Track ID | License Plate | Confidence | Timestamp | Frame | Context Image | Plate Crop |\n")
+            f.write("| :---: | :---: | :---: | :---: | :---: | :--- | :--- |\n")
+            for item in high_conf_outputs:
+                ctx_link = f"[View Context ROI](file://{item['Context_Image_Path']})"
+                plate_link = f"[View Plate](file://{item['Plate_Bilateral_Path']})"
+                f.write(f"| **{item['Track_ID']}** | `{item['License_Plate']}` | **{item['Confidence']}** | `{item['Timestamp']}` | {item['Frame_Number']} | {ctx_link} | {plate_link} |\n")
+        logger.info("Human-readable Final Outputs MD saved -> %s", final_outputs_md)
+
     # ── Stage 9: interpolation (of the validated/fused CSV only) ─────────────
     interpolated_csv = None
     try:
@@ -323,14 +386,6 @@ def run() -> None:
         logger.exception("Stage 9 (interpolation) failed")
 
     # ── Stage 10: annotated video ────────────────────────────────────────────
-    # FIX: previously rendered from the interpolated *validated-fusion-only*
-    # CSV, so with only a handful of fully-validated tracks the entire video
-    # showed almost no boxes. Now renders from RAW_CSV_PATH — every frame
-    # with a real plate detection, for every track, whether or not that
-    # track's OCR ever fully validated — so the output actually reflects
-    # everything the model detected, with tight per-frame boxes (no
-    # interpolation needed for these: each row is a real detection, not a
-    # guess between two real ones).
     if raw_rows:
         try:
             out = render_annotated_video(RAW_CSV_PATH, config.VIDEO_SOURCE, ANNOTATED_VIDEO)
