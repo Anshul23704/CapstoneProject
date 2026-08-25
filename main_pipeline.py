@@ -7,9 +7,13 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 from queue import Empty, Queue
 from typing import List
+
+import cv2
+import pandas as pd
 
 import config
 from stage1_frame_ingestion      import FrameIngestionStage, FrameIngestionConfig
@@ -93,10 +97,20 @@ def _result_consumer(
 
         try:
             fused_text, fused_conf, is_valid = "", 0.0, False
+            fused_b, conf_b = "", 0.0
+            fused_a, conf_a = "", 0.0
 
             if result.status == RecognitionStatus.SUCCESS and result.frame_readings:
                 readings_for_fusion = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings]
                 fused_text, fused_conf, is_valid = fusion.process(readings_for_fusion)
+
+                if result.frame_readings_bilateral:
+                    r_b = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_bilateral]
+                    fused_b, conf_b, _ = fusion.process(r_b)
+
+                if result.frame_readings_adaptive:
+                    r_a = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_adaptive]
+                    fused_a, conf_a, _ = fusion.process(r_a)
 
                 db.insert_result(
                     run_id=run_id,
@@ -108,6 +122,11 @@ def _result_consumer(
                     is_valid=is_valid,
                     plate_bbox=result.plate_bbox,
                     num_readings=len(result.frame_readings),
+                    plate_text_bilateral=fused_b,
+                    conf_bilateral=conf_b,
+                    plate_text_adaptive=fused_a,
+                    conf_adaptive=conf_a,
+                    winner_branch=result.winner_branch,
                 )
 
                 if is_valid and fused_text:
@@ -134,10 +153,11 @@ def _result_consumer(
                     status=result.status.name,
                     is_valid=False,
                     num_readings=len(result.frame_readings),
+                    winner_branch=result.winner_branch,
                 )
                 stats["no_plate"] += 1
 
-            # NEW: raw stream — every real detection, not just validated ones.
+            # Raw stream — every real detection, not just validated ones.
             for (vehicle_bbox, plate_bbox_full, frame_idx, ocr_text, ocr_conf) in result.raw_detections:
                 if plate_bbox_full is None:
                     continue
@@ -160,6 +180,7 @@ def _result_consumer(
 
 
 def run() -> None:
+    pipeline_start_time = time.time()
     logger.info("Loading models (vehicle=%s, plate=%s, device=%s)...",
                 config.VEHICLE_MODEL_PATH, config.PLATE_MODEL_PATH, config.DEVICE)
 
@@ -172,9 +193,19 @@ def run() -> None:
     result_queue:     Queue = Queue()
 
     job_creator = JobCreationStage(processing_queue, JobCreationConfig())
+    crops_dir   = os.path.join(OUTPUT_DIR, "plate_crops")
+    high_conf_crops_dir = os.path.join(OUTPUT_DIR, "plate_crops_high_confidence")
+    os.makedirs(crops_dir, exist_ok=True)
+    os.makedirs(high_conf_crops_dir, exist_ok=True)
     worker_pool = WorkerPoolStage(
         processing_queue, result_queue,
-        num_workers=config.NUM_WORKERS, config=WorkerConfig(),
+        num_workers=config.NUM_WORKERS,
+        config=WorkerConfig(
+            save_crops=True, 
+            crops_dir=crops_dir,
+            high_conf_crops_dir=high_conf_crops_dir,
+            high_conf_threshold=config.HIGH_CONF_CROP_THRESHOLD
+        ),
     )
     fusion = TemporalFusionStage(FusionConfig())
     db     = DatabaseAnalyticsStage(DatabaseConfig(db_path=DB_PATH))
@@ -193,7 +224,7 @@ def run() -> None:
     consumer_thread.start()
 
     ingestion = FrameIngestionStage(
-        FrameIngestionConfig(source=config.VIDEO_SOURCE, target_resolution=(1280, 720))
+        FrameIngestionConfig(source=config.VIDEO_SOURCE, target_resolution=None)
     )
 
     finalized_count = 0
@@ -257,16 +288,32 @@ def run() -> None:
         finalized_count, stats["fused_success"], stats["no_plate"],
     )
 
+    # ── Stage 8 Post-Processing: Plate-Guided Trajectory Stitching ──────────
+    stitched_rows, alias_map = DatabaseAnalyticsStage.stitch_fragmented_rows(rows, max_frame_gap=300)
+    if alias_map:
+        logger.info("Stitched %d fragmented track segments: %s", len(alias_map), alias_map)
+        # Apply alias map to raw_rows so video and visualizers show unified vehicle IDs
+        stitched_raw_rows = []
+        for r in raw_rows:
+            r_copy = dict(r)
+            tid = int(float(r_copy["car_id"]))
+            if tid in alias_map:
+                r_copy["car_id"] = alias_map[tid]
+            stitched_raw_rows.append(r_copy)
+        raw_rows = stitched_raw_rows
+    else:
+        stitched_rows = rows
+
     # ── Write rich CSV (fully-validated fused plates only) ──────────────────
-    rows.sort(key=lambda r: (r["frame_nmr"], r["car_id"]))
+    stitched_rows.sort(key=lambda r: (int(r["frame_nmr"]), int(float(r["car_id"]))))
     with open(RICH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
         writer.writeheader()
-        writer.writerows(rows)
-    logger.info("Rich CSV saved -> %s", RICH_CSV_PATH)
+        writer.writerows(stitched_rows)
+    logger.info("Rich CSV saved -> %s (%d rows)", RICH_CSV_PATH, len(stitched_rows))
 
     # ── Write raw detections CSV (every real detection, any track) ──────────
-    raw_rows.sort(key=lambda r: (r["frame_nmr"], r["car_id"]))
+    raw_rows.sort(key=lambda r: (int(r["frame_nmr"]), int(float(r["car_id"]))))
     with open(RAW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
         writer.writeheader()
@@ -279,6 +326,78 @@ def run() -> None:
         logger.info("Analytics -> %s", report_path)
     db.close()
 
+    # ── High-Confidence Final Outputs Export ──────────────────────────────────
+    final_outputs_csv = os.path.join(OUTPUT_DIR, "Final_outputs.csv")
+    final_outputs_md  = os.path.join(OUTPUT_DIR, "Final_outputs.md")
+    
+    # Calculate video FPS for timestamp calculation
+    try:
+        cap = cv2.VideoCapture(config.VIDEO_SOURCE)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+    except Exception:
+        fps = 30.0
+
+    # Group stitched detections by car_id to get highest confidence entry per vehicle
+    high_conf_outputs = []
+    if stitched_rows:
+        df_stitched = pd.DataFrame(stitched_rows)
+        for car_id, group in df_stitched.groupby("car_id"):
+            best_row = group.sort_values(by="license_number_score", ascending=False).iloc[0]
+            conf_val = float(best_row["license_number_score"])
+            if conf_val >= config.FINAL_OUTPUT_CONF_THRESHOLD:
+                f_idx = int(best_row["frame_nmr"])
+                plate_txt = str(best_row["license_number"])
+                sec = f_idx / fps
+                ts = f"{int(sec//3600):02d}:{int((sec%3600)//60):02d}:{sec%60:06.3f}"
+                
+                # Check for existing crop images
+                # Use high confidence folder if the confidence meets the threshold
+                target_dir = high_conf_crops_dir if conf_val >= config.HIGH_CONF_CROP_THRESHOLD else crops_dir
+                
+                context_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
+                plate_b_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
+                plate_a_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
+                
+                # If they don't exist in high_conf_crops_dir for some reason, fallback to crops_dir
+                if not os.path.exists(context_f):
+                    context_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
+                    plate_b_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
+                    plate_a_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
+                
+                high_conf_outputs.append({
+                    "Track_ID":                  int(car_id),
+                    "License_Plate":             plate_txt,
+                    "Confidence":                f"{conf_val:.4f}",
+                    "Timestamp":                 ts,
+                    "Frame_Number":              f_idx,
+                    "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
+                    "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
+                    "Plate_Adaptive_Path":       os.path.abspath(plate_a_f) if os.path.exists(plate_a_f) else plate_a_f,
+                })
+
+    high_conf_outputs.sort(key=lambda x: (x["Frame_Number"], x["Track_ID"]))
+
+    # Write Final_outputs.csv
+    if high_conf_outputs:
+        with open(final_outputs_csv, "w", newline="", encoding="utf-8") as f:
+            writer = csv.DictWriter(f, fieldnames=list(high_conf_outputs[0].keys()))
+            writer.writeheader()
+            writer.writerows(high_conf_outputs)
+        logger.info("High-confidence Final Outputs CSV saved -> %s (%d vehicles)", final_outputs_csv, len(high_conf_outputs))
+
+        # Write easy-to-read Final_outputs.md
+        with open(final_outputs_md, "w", encoding="utf-8") as f:
+            f.write(f"# High-Confidence License Plate Outputs — Run {RUN_ID}\n\n")
+            f.write(f"**Confidence Threshold:** $\\ge {config.FINAL_OUTPUT_CONF_THRESHOLD:.2f}$ | **Total Verified Vehicles:** {len(high_conf_outputs)}\n\n")
+            f.write("| Track ID | License Plate | Confidence | Timestamp | Frame | Context Image | Plate Crop |\n")
+            f.write("| :---: | :---: | :---: | :---: | :---: | :--- | :--- |\n")
+            for item in high_conf_outputs:
+                ctx_link = f"[View Context ROI](file://{item['Context_Image_Path']})"
+                plate_link = f"[View Plate](file://{item['Plate_Bilateral_Path']})"
+                f.write(f"| **{item['Track_ID']}** | `{item['License_Plate']}` | **{item['Confidence']}** | `{item['Timestamp']}` | {item['Frame_Number']} | {ctx_link} | {plate_link} |\n")
+        logger.info("Human-readable Final Outputs MD saved -> %s", final_outputs_md)
+
     # ── Stage 9: interpolation (of the validated/fused CSV only) ─────────────
     interpolated_csv = None
     try:
@@ -288,14 +407,6 @@ def run() -> None:
         logger.exception("Stage 9 (interpolation) failed")
 
     # ── Stage 10: annotated video ────────────────────────────────────────────
-    # FIX: previously rendered from the interpolated *validated-fusion-only*
-    # CSV, so with only a handful of fully-validated tracks the entire video
-    # showed almost no boxes. Now renders from RAW_CSV_PATH — every frame
-    # with a real plate detection, for every track, whether or not that
-    # track's OCR ever fully validated — so the output actually reflects
-    # everything the model detected, with tight per-frame boxes (no
-    # interpolation needed for these: each row is a real detection, not a
-    # guess between two real ones).
     if raw_rows:
         try:
             out = render_annotated_video(RAW_CSV_PATH, config.VIDEO_SOURCE, ANNOTATED_VIDEO)
@@ -305,6 +416,20 @@ def run() -> None:
             logger.exception("Stage 10 (visualization) failed")
     else:
         logger.warning("No raw detections at all — skipping Stage 10 video render")
+
+    # ── Final Metrics ────────────────────────────────────────────────────────
+    pipeline_end_time = time.time()
+    processing_time = pipeline_end_time - pipeline_start_time
+    try:
+        from final_metrics import generate_metrics_report
+        generate_metrics_report(
+            run_dir=OUTPUT_DIR,
+            processing_time=processing_time,
+            total_frames=total_frames,
+            fps=fps
+        )
+    except Exception:
+        logger.exception("Failed to generate research metrics")
 
     unique_plates = {row["license_number"] for row in rows}
     print("\n" + "=" * 60)

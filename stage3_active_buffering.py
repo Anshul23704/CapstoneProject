@@ -99,9 +99,9 @@ class VehicleBuffer:
 
 @dataclass
 class BufferingConfig:
-    max_buffer_size:  int = config.BUFFER_MAX_SIZE
+    max_buffer_size:  Optional[int] = config.BUFFER_MAX_SIZE
     timeout_frames:   int = config.BUFFER_TIMEOUT_FRAMES
-    force_finalize_at: int = config.BUFFER_FORCE_FINALIZE_AT
+    force_finalize_at: Optional[int] = config.BUFFER_FORCE_FINALIZE_AT
     max_vehicles:     int = 20
     roi_polygon:      Optional[np.ndarray] = None
 
@@ -153,7 +153,7 @@ class ActiveBufferingStage:
 
             frames_since_seen = frame_idx - buf.last_seen_frame
 
-            if len(buf.frames) >= self.cfg.force_finalize_at:
+            if self.cfg.force_finalize_at is not None and len(buf.frames) >= self.cfg.force_finalize_at:
                 self._finalize(buf, "force_finalize_at reached")
                 ready_for_finalization.append(buf.to_snapshot())
                 del self._registry[tid]
@@ -251,7 +251,7 @@ class ActiveBufferingStage:
         buf.last_seen_frame = frame_idx
         buf.last_seen_time  = timestamp
 
-        if len(buf.frames) > self.cfg.max_buffer_size:
+        if self.cfg.max_buffer_size is not None and len(buf.frames) > self.cfg.max_buffer_size:
             buf.frames.pop(0)
 
     # ── Static helpers ────────────────────────────────────────────────────────

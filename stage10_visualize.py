@@ -30,6 +30,8 @@ import cv2
 import numpy as np
 import pandas as pd
 
+from plate_utils import get_tilted_bbox
+
 logger = logging.getLogger(__name__)
 
 
@@ -93,7 +95,9 @@ def render_annotated_video(
                 cv2.rectangle(frame, (cx1, cy1), (cx2, cy2), (0, 255, 0), 3)
 
                 px1, py1, px2, py2 = map(int, _parse_bbox(row["license_plate_bbox"]))
-                cv2.rectangle(frame, (px1, py1), (px2, py2), (0, 0, 255), 3)
+                crop = frame[max(0, py1):py2, max(0, px1):px2]
+                tilted_box = get_tilted_bbox(crop, (px1, py1, px2, py2))
+                cv2.polylines(frame, [tilted_box], isClosed=True, color=(0, 0, 255), thickness=3)
 
                 text = str(row.get("license_number", "") or "")
                 if text and text.lower() != "nan":

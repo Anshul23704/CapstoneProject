@@ -53,10 +53,10 @@ class DetectionTrackingStage:
         )
 
     def process(self, frame: np.ndarray) -> Dict[int, BBox]:
+        orig_h, orig_w = frame.shape[:2]
+        detect_frame, scale = self._maybe_resize(frame)
 
-        frame = self._maybe_resize(frame)
-
-        raw_detections = self._detect(frame)
+        raw_detections = self._detect(detect_frame)
 
         if raw_detections is None:
             return {}
@@ -65,27 +65,21 @@ class DetectionTrackingStage:
 
         logger.debug("Tracker IDs: %s", tracked.tracker_id)
 
-        return self._to_dict(tracked)
+        return self._to_dict(tracked, scale=scale, orig_w=orig_w, orig_h=orig_h)
 
-    def _maybe_resize(self, frame: np.ndarray) -> np.ndarray:
-
+    def _maybe_resize(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
         h, w = frame.shape[:2]
-
         if w > self.cfg.max_frame_size:
-
-            scale = self.cfg.max_frame_size / w
-
+            scale = self.cfg.max_frame_size / float(w)
             frame = cv2.resize(
                 frame,
                 (self.cfg.max_frame_size, int(h * scale)),
             )
-
-        return frame
+            return frame, scale
+        return frame, 1.0
 
     def _detect(self, frame: np.ndarray):
-
         try:
-
             results = self._model(
                 frame,
                 conf=self.cfg.conf_threshold,
@@ -104,19 +98,30 @@ class DetectionTrackingStage:
             return None
 
     @staticmethod
-    def _to_dict(detections: sv.Detections) -> Dict[int, BBox]:
-
+    def _to_dict(
+        detections: sv.Detections,
+        scale: float = 1.0,
+        orig_w: int = 99999,
+        orig_h: int = 99999,
+    ) -> Dict[int, BBox]:
         result: Dict[int, BBox] = {}
 
         if detections.tracker_id is None:
             return result
 
-        for bbox, tid in zip(detections.xyxy, detections.tracker_id):
+        inv_scale = 1.0 / scale if scale > 0 else 1.0
 
+        for bbox, tid in zip(detections.xyxy, detections.tracker_id):
             if tid is None:
                 continue
 
-            x1, y1, x2, y2 = map(int, bbox)
-            result[int(tid)] = (x1, y1, x2, y2)
+            x1, y1, x2, y2 = bbox
+            rx1 = max(0, min(orig_w, int(round(x1 * inv_scale))))
+            ry1 = max(0, min(orig_h, int(round(y1 * inv_scale))))
+            rx2 = max(0, min(orig_w, int(round(x2 * inv_scale))))
+            ry2 = max(0, min(orig_h, int(round(y2 * inv_scale))))
+
+            if rx2 > rx1 and ry2 > ry1:
+                result[int(tid)] = (rx1, ry1, rx2, ry2)
 
         return result
