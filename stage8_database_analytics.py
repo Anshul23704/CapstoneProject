@@ -215,6 +215,22 @@ class DatabaseAnalyticsStage:
 
         return stitched_rows, alias_map
 
+    def dump_preprocessing_csv(self, run_id: Optional[str] = None, output_dir: str = ".") -> None:
+        """
+        Fast export of the current ocr_results table to results_preprocessing_comparison.csv
+        for real-time GUI updates.
+        """
+        df = self.fetch_run(run_id) if run_id else self.fetch_all()
+        if not df.empty:
+            comp_path = str(Path(output_dir) / "results_preprocessing_comparison.csv")
+            comp_cols = [c for c in [
+                "track_id", "status", "plate_text", "confidence",
+                "plate_text_bilateral", "conf_bilateral",
+                "plate_text_adaptive", "conf_adaptive",
+                "winner_branch", "num_readings", "stitched_track_ids",
+            ] if c in df.columns]
+            df[comp_cols].to_csv(comp_path, index=False)
+            
     # ── Analytics ─────────────────────────────────────────────────────────────
 
     def generate_report(self, run_id: Optional[str] = None, output_dir: str = ".") -> str:
