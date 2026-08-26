@@ -1,4 +1,4 @@
-# 🚗 Automatic License Plate Recognition (ALPR) & Vehicle Tracking Pipeline
+#  Automatic License Plate Recognition (ALPR) & Vehicle Tracking Pipeline
 
 [![Python](https://img.shields.io/badge/Python-3.9%2B-blue.svg)](https://www.python.org/)
 [![PyTorch](https://img.shields.io/badge/PyTorch-2.0%2B-ee4c2c.svg)](https://pytorch.org/)
@@ -11,7 +11,7 @@ A high-performance, multi-stage **Automatic License Plate Recognition (ALPR)** a
 
 ---
 
-## 📑 Table of Contents
+## Table of Contents
 
 - [Overview](#-overview)
 - [System Architecture](#-system-architecture)
@@ -27,7 +27,7 @@ A high-performance, multi-stage **Automatic License Plate Recognition (ALPR)** a
 
 ---
 
-## 🌟 Overview
+## Overview
 
 Recognizing license plates from traffic cameras in complex real-world conditions presents several challenges: rapid vehicle motion, motion blur, varying lighting, skewed camera angles, occlusions, and non-standard or multi-line plates. 
 
@@ -35,7 +35,7 @@ This ALPR pipeline addresses these challenges through a modular, multi-threaded,
 
 ---
 
-## 🏗️ System Architecture
+##  System Architecture
 
 ```mermaid
 flowchart TD
@@ -54,7 +54,7 @@ flowchart TD
 
 ---
 
-## 🔬 Detailed 10-Stage Pipeline
+##  Detailed 10-Stage Pipeline
 
 ### Stage 1: Frame Ingestion (`stage1_frame_ingestion.py`)
 - **Function**: Decodes video frames via OpenCV with asynchronous multi-threaded queueing.
@@ -112,7 +112,7 @@ flowchart TD
 
 ---
 
-## ⚡ Key Technical Highlights & Algorithms
+##  Key Technical Highlights & Algorithms
 
 | Feature | Description |
 | :--- | :--- |
@@ -126,7 +126,7 @@ flowchart TD
 
 ---
 
-## 📁 Directory & File Structure
+##  Directory & File Structure
 
 ```text
 CapstoneProject/
@@ -160,7 +160,7 @@ CapstoneProject/
 
 ---
 
-## 🚀 Installation & Setup
+## Installation & Setup
 
 ### 1. Clone the Repository
 ```bash
@@ -221,7 +221,7 @@ NUM_WORKERS = 3               # Concurrent OCR worker threads
 
 ---
 
-## 💻 How to Run
+## How to Run
 
 ### Run the Complete Pipeline
 Execute the full 10-stage pipeline on the default video source:
@@ -242,7 +242,7 @@ streamlit run GUI/app.py
 
 ---
 
-## 🖥️ Streamlit Research Console
+##  Streamlit Research Console
 
 The included Streamlit console (`GUI/app.py`) provides an interactive interface for:
 - **Run Discovery & Telemetry**: Automatically detects run directories in `output/` and displays processing timestamps, frame counts, and hardware usage.
@@ -253,7 +253,7 @@ The included Streamlit console (`GUI/app.py`) provides an interactive interface 
 
 ---
 
-## 📊 Output Artifacts & Data Schema
+## Output Artifacts & Data Schema
 
 Each pipeline execution produces a timestamped folder inside `output/<YYYYMMDD_HHMMSS>/`:
 
