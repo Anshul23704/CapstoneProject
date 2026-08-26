@@ -270,6 +270,6 @@ Each pipeline execution produces a timestamped folder inside `output/<YYYYMMDD_H
 
 ---
 
-## 📜 License
+## License
 
 This project is developed as part of an Engineering Capstone. Distributed under the MIT License.
