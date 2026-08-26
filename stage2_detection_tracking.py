@@ -46,26 +46,20 @@ class DetectionTrackingStage:
         self._model = YOLO(config.model_path)
         self._model.to(config.device)
 
-        self._tracker = sv.ByteTrack(
-            track_activation_threshold=config.conf_threshold,
-            lost_track_buffer=config.track_buffer,
-            minimum_matching_threshold=config.match_threshold,
-        )
+        self._model.to(config.device)
 
     def process(self, frame: np.ndarray) -> Dict[int, BBox]:
         orig_h, orig_w = frame.shape[:2]
         detect_frame, scale = self._maybe_resize(frame)
 
-        raw_detections = self._detect(detect_frame)
+        tracked_detections = self._detect(detect_frame)
 
-        if raw_detections is None:
+        if tracked_detections is None:
             return {}
 
-        tracked = self._tracker.update_with_detections(raw_detections)
+        logger.debug("Tracker IDs: %s", tracked_detections.tracker_id)
 
-        logger.debug("Tracker IDs: %s", tracked.tracker_id)
-
-        return self._to_dict(tracked, scale=scale, orig_w=orig_w, orig_h=orig_h)
+        return self._to_dict(tracked_detections, scale=scale, orig_w=orig_w, orig_h=orig_h)
 
     def _maybe_resize(self, frame: np.ndarray) -> Tuple[np.ndarray, float]:
         h, w = frame.shape[:2]
@@ -80,10 +74,12 @@ class DetectionTrackingStage:
 
     def _detect(self, frame: np.ndarray):
         try:
-            results = self._model(
+            results = self._model.track(
                 frame,
                 conf=self.cfg.conf_threshold,
                 iou=self.cfg.iou_threshold,
+                tracker="botsort.yaml",
+                persist=True,
                 verbose=False,
             )[0]
 

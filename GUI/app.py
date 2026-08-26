@@ -566,8 +566,7 @@ elif page == "Pipeline":
                     "confidence",
                     "plate_text_bilateral",
                     "conf_bilateral",
-                    "plate_text_adaptive",
-                    "conf_adaptive",
+
                     "winner_branch",
                     "stitched_track_ids"
                 ]
@@ -653,15 +652,13 @@ elif page == "Vehicles":
         if not db_t.empty:
             st.subheader("Recognition chain")
             for _, r in db_t.iterrows():
-                cols = st.columns(4)
+                cols = st.columns(3)
                 with cols[0]:
                     metric_card("Status", str(r.get("status", "—")), f"job {str(r.get('job_id','—'))[:8]}")
                 with cols[1]:
                     metric_card("Fusion", str(r.get("plate_text") or "—"), f"confidence {float(r.get('confidence',0)):.4f}")
                 with cols[2]:
                     metric_card("Bilateral", str(r.get("plate_text_bilateral") or "—"), f"{float(r.get('conf_bilateral',0)):.4f}")
-                with cols[3]:
-                    metric_card("Adaptive", str(r.get("plate_text_adaptive") or "—"), f"{float(r.get('conf_adaptive',0)):.4f}")
                 st.markdown(
                     f'<div class="trace">winner={r.get("winner_branch","—")} · '
                     f'readings={r.get("num_readings","—")} · '
@@ -713,11 +710,10 @@ elif page == "Evidence":
         with c[3]: metric_card("Readings", fmt_num(row.num_readings))
 
         st.write("")
-        cols = st.columns(3)
+        cols = st.columns(2)
         for col, label, text_field, conf_field in [
             (cols[0], "BILATERAL", "plate_text_bilateral", "conf_bilateral"),
-            (cols[1], "ADAPTIVE", "plate_text_adaptive", "conf_adaptive"),
-            (cols[2], "FUSION", "plate_text", "confidence"),
+            (cols[1], "FUSION", "plate_text", "confidence"),
         ]:
             with col:
                 st.markdown(f'<div class="evidence"><b>{label}</b><div class="big-plate">{row.get(text_field) or "—"}</div><span class="small">confidence {float(row.get(conf_field,0)):.4f}</span></div>', unsafe_allow_html=True)
@@ -727,11 +723,10 @@ elif page == "Evidence":
         if not final_t.empty:
             r = final_t.iloc[0]
             st.subheader("Actual image evidence")
-            cols = st.columns(3)
+            cols = st.columns(2)
             for col, label, field in [
                 (cols[0], "Context frame", "Context_Image_Path"),
                 (cols[1], "Bilateral crop", "Plate_Bilateral_Path"),
-                (cols[2], "Adaptive crop", "Plate_Adaptive_Path"),
             ]:
                 p = find_artifact_image(run, r.get(field))
                 with col:
@@ -768,11 +763,9 @@ elif page == "Analytics":
     if not prep.empty:
         successful_p = prep[prep["status"] == "SUCCESS"].copy()
         winner_counts = successful_p["winner_branch"].value_counts()
-        cols = st.columns(4)
+        cols = st.columns(2)
         with cols[0]: metric_card("Successful jobs", fmt_num(len(successful_p)))
         with cols[1]: metric_card("Bilateral wins", fmt_num(int((successful_p["winner_branch"]=="bilateral").sum())))
-        with cols[2]: metric_card("Adaptive wins", fmt_num(int((successful_p["winner_branch"]=="adaptive").sum())))
-        with cols[3]: metric_card("Ties", fmt_num(int((successful_p["winner_branch"]=="tie").sum())))
         st.bar_chart(winner_counts, height=260)
         st.caption("Winner labels are read from results_preprocessing_comparison.csv; no accuracy claim is implied.")
 
@@ -857,7 +850,7 @@ elif page == "Analytics":
         # Confidence comparison
         st.subheader("4 · Confidence comparison")
         if not prep.empty:
-            comp = prep[prep["status"]=="SUCCESS"][["track_id","conf_bilateral","conf_adaptive","confidence"]].copy()
+            comp = prep[prep["status"]=="SUCCESS"][["track_id","conf_bilateral","confidence"]].copy()
             comp = comp.set_index("track_id")
             st.line_chart(comp, height=300)
 

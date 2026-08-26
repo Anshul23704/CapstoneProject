@@ -45,7 +45,6 @@ from plate_utils import (
     clean_ocr_text,
     deskew_plate_crop,
     enhance_plate_crop_bilateral,
-    enhance_plate_crop_adaptive,
     laplacian_sharpness,
     license_complies_format,
     format_license,
@@ -74,7 +73,6 @@ class _DiagnosticCounters:
         self.ocr_format_rejected = 0  # every OCR detection too short/long to plausibly be a plate
         self.ocr_forwarded_plausible = 0  # forwarded to fusion without being independently valid
         self.ocr_forwarded_bilateral = 0
-        self.ocr_forwarded_adaptive = 0
 
     def bump(self, field: str) -> None:
         with self._lock:
@@ -93,7 +91,6 @@ class _DiagnosticCounters:
             f"\n  OCR too short/long (noise)  : {self.ocr_format_rejected}"
             f"\n  OCR forwarded to fusion     : {self.ocr_forwarded_plausible}"
             f"\n    └─ Bilateral branch reads : {self.ocr_forwarded_bilateral}"
-            f"\n    └─ Adaptive branch reads  : {self.ocr_forwarded_adaptive}"
             "\n" + "=" * 60
         )
 
@@ -144,7 +141,6 @@ class RecognitionResult:
     frame_readings:           tuple = ()
     # Specific per-branch readings for side-by-side comparison:
     frame_readings_bilateral: tuple = ()
-    frame_readings_adaptive:  tuple = ()
     # Raw bounding boxes for Stage 10 video rendering
     raw_detections:           tuple = ()
     winner_branch:            str = "none"
@@ -208,11 +204,9 @@ class Worker(threading.Thread):
         best_bbox: Optional[BBox] = None
         frame_readings: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
         readings_bilateral: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
-        readings_adaptive: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
         raw_detections: List[Tuple[BBox, Optional[BBox], int, str, float]] = []
 
         bilateral_wins = 0
-        adaptive_wins = 0
 
         for frame_entry in job.selected_frames:
 
@@ -238,51 +232,31 @@ class Worker(threading.Thread):
             # 1. Perspective Deskewing
             plate_deskewed = deskew_plate_crop(plate_crop)
 
-            # 2. Parallel Preprocessing Branches
+            # 2. Preprocessing
             plate_bilateral = enhance_plate_crop_bilateral(
                 plate_deskewed, upscale_factor=self.cfg.upscale_factor
             )
-            plate_adaptive = enhance_plate_crop_adaptive(
-                plate_deskewed, upscale_factor=self.cfg.upscale_factor
-            )
 
-            # 3. Parallel OCR Recognition
+            # 3. OCR Recognition
             tag_b = f"t{job.track_id}_f{frame_entry.frame_idx}_bilateral"
-            tag_a = f"t{job.track_id}_f{frame_entry.frame_idx}_adaptive"
             text_b, conf_b = self._run_ocr_validated(plate_bilateral, tag=tag_b)
-            text_a, conf_a = self._run_ocr_validated(plate_adaptive, tag=tag_a)
 
             if text_b:
                 DIAG.bump("ocr_forwarded_bilateral")
                 readings_bilateral.append(
                     (text_b, conf_b, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
                 )
-            if text_a:
-                DIAG.bump("ocr_forwarded_adaptive")
-                readings_adaptive.append(
-                    (text_a, conf_a, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
-                )
-
-            # Select best candidate for frame
-            if conf_b >= conf_a and text_b:
-                frame_text, frame_conf = text_b, conf_b
-                bilateral_wins += 1
-            elif text_a:
-                frame_text, frame_conf = text_a, conf_a
-                adaptive_wins += 1
-            elif text_b:
                 frame_text, frame_conf = text_b, conf_b
                 bilateral_wins += 1
             else:
                 frame_text, frame_conf = "", 0.0
 
-            # 4. Save both enhanced crops and comparison context image
+            # 4. Save enhanced crop and comparison context image
             if self.cfg.save_crops and self.cfg.crops_dir:
                 try:
                     os.makedirs(self.cfg.crops_dir, exist_ok=True)
                     prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
                     cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate_bilateral.png"), plate_bilateral)
-                    cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate_adaptive.png"), plate_adaptive)
 
                     roi = frame_entry.full_frame
                     if roi is not None and roi.size > 0:
@@ -297,11 +271,8 @@ class Worker(threading.Thread):
                         
                         # Comparison Label Overlay
                         lbl_b = f"Bilateral: {text_b} ({conf_b:.2f})" if text_b else "Bilateral: --"
-                        lbl_a = f"Adaptive:  {text_a} ({conf_a:.2f})" if text_a else "Adaptive:  --"
                         cv2.putText(context_img, lbl_b, (lx1, max(18, ly1 - 18)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
-                        cv2.putText(context_img, lbl_a, (lx1, max(32, ly1 - 4)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 200, 255), 1, cv2.LINE_AA)
                         cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_context.png"), context_img)
                 except Exception as exc:
                     logger.debug("Failed saving crop image: %s", exc)
@@ -321,7 +292,7 @@ class Worker(threading.Thread):
                     best_bbox = frame_entry.plate_bbox
 
         status = RecognitionStatus.SUCCESS if best_text else RecognitionStatus.NO_PLATE
-        winner = "bilateral" if bilateral_wins > adaptive_wins else ("adaptive" if adaptive_wins > bilateral_wins else ("tie" if bilateral_wins > 0 else "none"))
+        winner = "bilateral"
 
         return RecognitionResult(
             job_id                   = job.job_id,
@@ -332,7 +303,6 @@ class Worker(threading.Thread):
             plate_bbox               = best_bbox,
             frame_readings           = tuple(frame_readings),
             frame_readings_bilateral = tuple(readings_bilateral),
-            frame_readings_adaptive  = tuple(readings_adaptive),
             raw_detections           = tuple(raw_detections),
             winner_branch            = winner,
         )

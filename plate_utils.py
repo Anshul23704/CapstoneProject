@@ -269,48 +269,17 @@ def enhance_plate_crop_bilateral(
         )
 
     gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-    filtered = cv2.bilateralFilter(gray, d=11, sigmaColor=17, sigmaSpace=17)
+    
+    # Thin the characters (text is black on white, so dilation expands the white background)
+    kernel = np.ones((2, 2), np.uint8)
+    thinned = cv2.dilate(gray, kernel, iterations=1)
+    
+    filtered = cv2.bilateralFilter(thinned, d=11, sigmaColor=17, sigmaSpace=17)
 
     return cv2.cvtColor(filtered, cv2.COLOR_GRAY2BGR)
 
 
-def enhance_plate_crop_adaptive(
-    plate_crop: np.ndarray,
-    upscale_factor: float = 2.0,
-    min_width: int = 120,
-    min_height: int = 30,
-) -> np.ndarray:
-    """
-    Branch B: Contrast & Illumination Adaptive Thresholding.
-    Combines Top-Hat / Black-Hat morphological filtering to isolate dark embossed
-    characters from bright reflective backgrounds, followed by CLAHE contrast equalization.
-    """
-    if plate_crop is None or plate_crop.size == 0:
-        return plate_crop
 
-    h, w = plate_crop.shape[:2]
-    scale = max(upscale_factor, min_width / max(w, 1), min_height / max(h, 1))
-    if scale > 1.0:
-        plate_crop = cv2.resize(
-            plate_crop,
-            (max(1, int(w * scale)), max(1, int(h * scale))),
-            interpolation=cv2.INTER_LANCZOS4,
-        )
-
-    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
-
-    # Morphological Top-Hat / Black-Hat to separate embossed text from uneven background lighting
-    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (9, 5))
-    tophat = cv2.morphologyEx(gray, cv2.MORPH_TOPHAT, kernel)
-    blackhat = cv2.morphologyEx(gray, cv2.MORPH_BLACKHAT, kernel)
-    contrast_img = cv2.add(gray, tophat)
-    contrast_img = cv2.subtract(contrast_img, blackhat)
-
-    # Local CLAHE adaptive equalization
-    clahe = cv2.createCLAHE(clipLimit=2.5, tileGridSize=(6, 6))
-    equalized = clahe.apply(contrast_img)
-
-    return cv2.cvtColor(equalized, cv2.COLOR_GRAY2BGR)
 
 
 def plate_edge_density(plate_crop: np.ndarray) -> float:

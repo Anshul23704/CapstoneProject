@@ -62,8 +62,6 @@ class DatabaseAnalyticsStage:
         num_readings           INTEGER NOT NULL DEFAULT 0,
         plate_text_bilateral   TEXT,
         conf_bilateral         REAL    DEFAULT 0.0,
-        plate_text_adaptive    TEXT,
-        conf_adaptive          REAL    DEFAULT 0.0,
         winner_branch          TEXT    DEFAULT 'none',
         stitched_track_ids     TEXT,
         low_diversity          INTEGER NOT NULL DEFAULT 0,
@@ -102,8 +100,6 @@ class DatabaseAnalyticsStage:
         num_readings:         int   = 0,
         plate_text_bilateral: str   = "",
         conf_bilateral:       float = 0.0,
-        plate_text_adaptive:  str   = "",
-        conf_adaptive:        float = 0.0,
         winner_branch:        str   = "none",
         stitched_track_ids:   str   = "",
         low_diversity:        bool  = False,
@@ -114,9 +110,9 @@ class DatabaseAnalyticsStage:
                 (run_id, track_id, job_id, plate_text, confidence,
                  status, is_valid, finalize_reason, plate_bbox,
                  num_readings, plate_text_bilateral, conf_bilateral,
-                 plate_text_adaptive, conf_adaptive, winner_branch,
+                 winner_branch,
                  stitched_track_ids, low_diversity, possible_id_switch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with self._lock:
             self._conn.execute(sql, (
@@ -125,7 +121,7 @@ class DatabaseAnalyticsStage:
                 int(is_valid), finalize_reason,
                 str(plate_bbox) if plate_bbox else None,
                 num_readings, plate_text_bilateral, conf_bilateral,
-                plate_text_adaptive, conf_adaptive, winner_branch,
+                winner_branch,
                 stitched_track_ids, int(low_diversity), int(possible_id_switch),
             ))
             self._conn.commit()
@@ -226,7 +222,6 @@ class DatabaseAnalyticsStage:
             comp_cols = [c for c in [
                 "track_id", "status", "plate_text", "confidence",
                 "plate_text_bilateral", "conf_bilateral",
-                "plate_text_adaptive", "conf_adaptive",
                 "winner_branch", "num_readings", "stitched_track_ids",
             ] if c in df.columns]
             df[comp_cols].to_csv(comp_path, index=False)
@@ -255,28 +250,14 @@ class DatabaseAnalyticsStage:
         axes[0, 0].set_title("Recognition Status Breakdown", fontsize=11, fontweight="bold")
         axes[0, 0].set_ylabel("Count")
 
-        # Panel 2: Preprocessing Comparison (Bilateral vs Adaptive)
-        success_df = df[df["status"] == "SUCCESS"].copy()
-        if not success_df.empty and "winner_branch" in success_df.columns:
-            winner_counts = success_df["winner_branch"].value_counts()
-            axes[0, 1].pie(
-                winner_counts.values,
-                labels=winner_counts.index,
-                autopct="%1.1f%%",
-                colors=["#3498db", "#f39c12", "#2ecc71", "#95a5a6"],
-                startangle=140,
-            )
-            axes[0, 1].set_title("Preprocessing Branch Winner Share (Bilateral vs Adaptive)", fontsize=11, fontweight="bold")
-        else:
-            axes[0, 1].text(0.5, 0.5, "No Success Data", ha="center", va="center")
+        axes[0, 1].axis("off")
 
         # Panel 3: Confidence Comparison Boxplot / Histogram
-        if not success_df.empty:
+        success_df = df[df["is_valid"] == 1]
+        if not success_df.empty and "conf_bilateral" in success_df.columns:
             b_confs = success_df["conf_bilateral"].dropna()
-            a_confs = success_df["conf_adaptive"].dropna()
             axes[1, 0].hist(b_confs, bins=15, alpha=0.6, label="Bilateral", color="steelblue")
-            axes[1, 0].hist(a_confs, bins=15, alpha=0.6, label="Adaptive", color="darkorange")
-            axes[1, 0].set_title("Confidence Distribution by Preprocessing Branch", fontsize=11, fontweight="bold")
+            axes[1, 0].set_title("Confidence Distribution", fontsize=11, fontweight="bold")
             axes[1, 0].set_xlabel("Confidence Score")
             axes[1, 0].set_ylabel("Frequency")
             axes[1, 0].legend()
@@ -307,7 +288,6 @@ class DatabaseAnalyticsStage:
             comp_cols = [c for c in [
                 "track_id", "status", "plate_text", "confidence",
                 "plate_text_bilateral", "conf_bilateral",
-                "plate_text_adaptive", "conf_adaptive",
                 "winner_branch", "num_readings", "stitched_track_ids",
             ] if c in df.columns]
             df[comp_cols].to_csv(comp_path, index=False)

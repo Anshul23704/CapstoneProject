@@ -116,7 +116,6 @@ def _result_consumer(
         try:
             fused_text, fused_conf, is_valid = "", 0.0, False
             fused_b, conf_b = "", 0.0
-            fused_a, conf_a = "", 0.0
 
             if result.status == RecognitionStatus.SUCCESS and result.frame_readings:
                 readings_for_fusion = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings]
@@ -126,9 +125,7 @@ def _result_consumer(
                     r_b = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_bilateral]
                     fused_b, conf_b, _ = fusion.process(r_b)
 
-                if result.frame_readings_adaptive:
-                    r_a = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_adaptive]
-                    fused_a, conf_a, _ = fusion.process(r_a)
+
 
                 db.insert_result(
                     run_id=run_id,
@@ -142,8 +139,7 @@ def _result_consumer(
                     num_readings=len(result.frame_readings),
                     plate_text_bilateral=fused_b,
                     conf_bilateral=conf_b,
-                    plate_text_adaptive=fused_a,
-                    conf_adaptive=conf_a,
+
                     winner_branch=result.winner_branch,
                 )
 
@@ -177,7 +173,6 @@ def _result_consumer(
                             
                             context_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_context.png")
                             plate_b_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_plate_bilateral.png")
-                            plate_a_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_plate_adaptive.png")
                             
                             best_detections[result.track_id] = {
                                 "Track_ID":                  int(result.track_id),
@@ -187,7 +182,6 @@ def _result_consumer(
                                 "Frame_Number":              best_frame,
                                 "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
                                 "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
-                                "Plate_Adaptive_Path":       os.path.abspath(plate_a_f) if os.path.exists(plate_a_f) else plate_a_f,
                             }
             else:
                 db.insert_result(
@@ -435,7 +429,6 @@ def run() -> None:
                 # Check for existing crop images
                 context_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
                 plate_b_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
-                plate_a_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
                 
                 high_conf_outputs.append({
                     "Track_ID":                  int(car_id),
@@ -445,7 +438,6 @@ def run() -> None:
                     "Frame_Number":              f_idx,
                     "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
                     "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
-                    "Plate_Adaptive_Path":       os.path.abspath(plate_a_f) if os.path.exists(plate_a_f) else plate_a_f,
                 })
 
     high_conf_outputs.sort(key=lambda x: (x["Frame_Number"], x["Track_ID"]))
