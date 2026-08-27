@@ -24,9 +24,9 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 
 APP_ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = Path(r"E:\Capstone\CapstoneProject-main\implementation\output\20260824_111830")
+OUTPUT_ROOT = Path(r"E:\Capstone\CapstoneProject-main\implementation\output")
 RUN_ROOT_ENV = os.getenv("ALPR_RUN_ROOT", "").strip()
-REFRESH_SECONDS = max(1, int(os.getenv("REFRESH_SECONDS", "10")))
+REFRESH_SECONDS = max(1, int(os.getenv("REFRESH_SECONDS", "2")))
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER_RUNS", "true").lower() == "true"
 
 KNOWN_FILES = {
@@ -55,56 +55,90 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Outfit:wght@400;600;800&display=swap');
+
 :root {
-  --bg:#0a0f14; --panel:#101821; --panel2:#131e29; --border:#263443;
-  --text:#eef4f8; --muted:#91a0ae; --blue:#67b7ff; --green:#5be08a;
-  --amber:#f4c66d; --red:#ff7788;
+  --bg: #07090e; --panel: rgba(16, 24, 33, 0.65); --panel-hover: rgba(22, 33, 46, 0.85); --border: rgba(38, 52, 67, 0.5);
+  --text: #eef4f8; --muted: #91a0ae; --blue: #00d2ff; --green: #00e676;
+  --amber: #ffca28; --red: #ff5252;
 }
-[data-testid="stAppViewContainer"] { background:var(--bg); }
-[data-testid="stSidebar"] { background:#0d141c; border-right:1px solid var(--border); }
-.block-container { max-width:1500px; padding-top:1.4rem; padding-bottom:4rem; }
-h1,h2,h3 { letter-spacing:-.025em; }
-.small { color:var(--muted); font-size:.82rem; }
-.eyebrow { color:var(--blue); font-size:.72rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }
+* { font-family: 'Inter', sans-serif; }
+h1, h2, h3, .metric-value, .big-plate, .stage-title { font-family: 'Outfit', sans-serif; letter-spacing: -0.02em; }
+[data-testid="stAppViewContainer"] { 
+    background: radial-gradient(circle at top right, #111a28, #07090e 60%); 
+}
+[data-testid="stSidebar"] { 
+    background: rgba(10, 15, 22, 0.8) !important; 
+    backdrop-filter: blur(12px); 
+    border-right: 1px solid var(--border); 
+}
+.block-container { max-width: 1500px; padding-top: 2rem; padding-bottom: 4rem; }
+.small { color: var(--muted); font-size: 0.85rem; }
+.eyebrow { 
+    color: var(--blue); font-size: 0.75rem; font-weight: 800; letter-spacing: 0.2em; text-transform: uppercase;
+    text-shadow: 0 0 10px rgba(0, 210, 255, 0.4);
+}
 .card {
-  background:linear-gradient(145deg,var(--panel),#0d151e);
-  border:1px solid var(--border); border-radius:15px; padding:17px 19px;
-  min-height:105px;
+  background: var(--panel);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border); border-radius: 16px; padding: 20px;
+  min-height: 110px; box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+  transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), border-color 0.3s ease, box-shadow 0.3s ease;
 }
-.metric-label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; }
-.metric-value { color:var(--text); font-size:1.72rem; font-weight:800; margin-top:4px; }
-.metric-sub { color:var(--muted); font-size:.76rem; margin-top:3px; }
+.card:hover {
+    transform: translateY(-5px); border-color: rgba(0, 210, 255, 0.4);
+    box-shadow: 0 12px 40px 0 rgba(0, 210, 255, 0.15);
+}
+.metric-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600;}
+.metric-value { 
+    color: var(--text); font-size: 2rem; font-weight: 800; margin-top: 6px;
+    background: linear-gradient(90deg, #fff, #b3d4ff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.metric-sub { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
 .pill {
-  display:inline-block; padding:4px 9px; border-radius:999px;
-  font-size:.72rem; font-weight:800; border:1px solid var(--border);
-  background:#15212c; color:#cbd7e1;
+  display: inline-flex; align-items: center; justify-content: center; padding: 6px 12px; border-radius: 999px;
+  font-size: 0.75rem; font-weight: 800; border: 1px solid var(--border);
+  background: rgba(21, 33, 44, 0.8); color: #cbd7e1;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.2); backdrop-filter: blur(5px);
 }
-.pill-green { background:#123022; color:#78e6a0; border-color:#1d5136; }
-.pill-amber { background:#322712; color:#f2cb77; border-color:#5b451c; }
-.pill-blue { background:#102b42; color:#91d0ff; border-color:#1c4e72; }
-.pill-red { background:#351820; color:#ff9aaa; border-color:#5b2732; }
+.pill-green { background: rgba(0, 230, 118, 0.1); color: #00e676; border-color: rgba(0, 230, 118, 0.3); box-shadow: 0 0 10px rgba(0, 230, 118, 0.2); }
+.pill-amber { background: rgba(255, 202, 40, 0.1); color: #ffca28; border-color: rgba(255, 202, 40, 0.3); box-shadow: 0 0 10px rgba(255, 202, 40, 0.2); }
+.pill-blue { background: rgba(0, 210, 255, 0.1); color: #00d2ff; border-color: rgba(0, 210, 255, 0.3); box-shadow: 0 0 10px rgba(0, 210, 255, 0.2); }
+.pill-red { background: rgba(255, 82, 82, 0.1); color: #ff5252; border-color: rgba(255, 82, 82, 0.3); box-shadow: 0 0 10px rgba(255, 82, 82, 0.2); }
 .stage {
-  border:1px solid var(--border); border-radius:13px; background:var(--panel);
-  padding:13px 11px; min-height:88px;
+  border: 1px solid var(--border); border-radius: 14px; background: var(--panel);
+  padding: 16px; min-height: 95px; transition: all 0.3s ease; backdrop-filter: blur(10px);
 }
-.stage-title { font-weight:800; font-size:.80rem; }
-.stage-meta { color:var(--muted); font-size:.68rem; margin-top:5px; line-height:1.35; }
-.stage-dot { font-size:.65rem; margin-right:5px; }
+.stage:hover { background: var(--panel-hover); border-color: rgba(255,255,255,0.2); }
+.stage-title { font-weight: 800; font-size: 0.85rem; color: #fff; }
+.stage-meta { color: var(--muted); font-size: 0.75rem; margin-top: 6px; line-height: 1.4; }
 .callout {
-  border-left:3px solid var(--blue); background:#0e1923; padding:12px 15px;
-  border-radius:7px; color:#c2ced8;
+  border-left: 4px solid var(--blue); background: linear-gradient(90deg, rgba(0, 210, 255, 0.1), transparent);
+  padding: 16px 20px; border-radius: 0 10px 10px 0; color: #d1e0ec; font-size: 0.9rem;
 }
 .evidence {
-  background:#0d151e; border:1px solid var(--border); border-radius:14px;
-  padding:15px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+  padding: 20px; text-align: center; backdrop-filter: blur(10px);
 }
-.big-plate { font-size:1.55rem; font-weight:850; letter-spacing:.05em; }
+.big-plate { 
+    font-size: 1.8rem; font-weight: 800; letter-spacing: 0.1em; color: #fff; 
+    margin: 10px 0; text-shadow: 0 0 15px rgba(255,255,255,0.2);
+}
 .trace {
-  background:#0c131a; border:1px solid var(--border); border-radius:10px;
-  padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  font-size:.78rem;
+  background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 16px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.8rem; color: #a1b0c0;
 }
-hr { border-color:var(--border); }
+.progress-container { width: 100%; background-color: #1a242f; border-radius: 999px; overflow: hidden; height: 12px; margin-top: 15px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.3); }
+.progress-bar { height: 100%; background: linear-gradient(90deg, #00d2ff, #3a7bd5); transition: width 0.4s ease; box-shadow: 0 0 10px rgba(0,210,255,0.5); }
+.status-flex { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
+hr { border-color: var(--border); margin: 2rem 0; }
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(0, 210, 255, 0.4); }
+  70% { box-shadow: 0 0 0 10px rgba(0, 210, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 210, 255, 0); }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -207,6 +241,13 @@ def load_artifacts(run: Path) -> dict[str, pd.DataFrame]:
         out[key] = read_csv(str(p), p.stat().st_mtime_ns if p.exists() else -1) if p.exists() else pd.DataFrame()
     p = artifact_path(run, "db")
     out["db"] = read_db(str(p), p.stat().st_mtime_ns if p.exists() else -1) if p.exists() else pd.DataFrame()
+    
+    # Force object columns to strings to prevent PyArrow ArrowInvalid mixed-type errors
+    for k, df in out.items():
+        if not df.empty:
+            for col in df.select_dtypes(include=['object']).columns:
+                out[k][col] = df[col].astype(str)
+                
     return out
 
 def read_metrics_text(run: Path) -> str:
@@ -271,6 +312,17 @@ def artifact_inventory(run: Path) -> pd.DataFrame:
         count = sum(1 for _ in p.rglob("*") if _.is_file()) if p.exists() else 0
         rows.append({"artifact": d + "/", "purpose": "images", "status": "AVAILABLE" if p.exists() else "MISSING", "size": f"{count} files", "modified": "—"})
     return pd.DataFrame(rows)
+
+def read_status(run: Path) -> dict:
+    p = run / "status.json"
+    if p.exists():
+        try:
+            import json
+            with open(p, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
 
 # ---------------------------------------------------------------------------
 # Run selection
@@ -344,6 +396,28 @@ if page == "Overview":
         unsafe_allow_html=True,
     )
     st.write("")
+    
+    status_data = read_status(run)
+    is_running = status_data.get("status") == "running"
+    
+    if is_running:
+        pct = min(100, (status_data.get('frame_idx', 0) / max(status_data.get('total_frames', 1), 1)) * 100)
+        st.markdown(f"""
+        <div class="card" style="margin-bottom: 2rem; border-color: #00d2ff; animation: pulse 2s infinite;">
+            <div class="eyebrow" style="margin-bottom: 5px;"><span class="pill pill-blue" style="margin-right: 10px;">LIVE</span> Pipeline is running</div>
+            <div class="status-flex">
+                <div>
+                    <div style="font-family: 'Outfit'; font-size: 1.5rem; font-weight: 600; color: #fff;">Processing Frame {status_data.get('frame_idx', 0):,} / {status_data.get('total_frames', 0):,}</div>
+                </div>
+                <div style="text-align: right;">
+                    <div class="small" style="color: #cbd7e1;">Active Vehicles: <b style="color: #fff;">{status_data.get('active_count', 0)}</b> | Finalized: <b style="color: #fff;">{status_data.get('finalized_count', 0)}</b></div>
+                </div>
+            </div>
+            <div class="progress-container">
+                <div class="progress-bar" style="width: {pct}%;"></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
     total_raw = len(raw)
     raw_tracks = unique_count(raw, "car_id")
@@ -684,8 +758,12 @@ elif page == "Vehicles":
                 p = find_artifact_image(run, row.get(field))
                 with col:
                     st.markdown(f"**{label}**")
-                    if p:
-                        st.image(str(p), width="stretch", caption=p.name)
+                    if p and p.exists():
+                        try:
+                            with open(p, "rb") as f:
+                                st.image(f.read(), width="stretch", caption=p.name)
+                        except Exception:
+                            st.warning("Could not read image file.")
                     else:
                         st.info("Image not found in this run directory.")
 
@@ -737,8 +815,12 @@ elif page == "Evidence":
                 p = find_artifact_image(run, r.get(field))
                 with col:
                     st.markdown(f"**{label}**")
-                    if p:
-                        st.image(str(p), width="stretch", caption=p.name)
+                    if p and p.exists():
+                        try:
+                            with open(p, "rb") as f:
+                                st.image(f.read(), width="stretch", caption=p.name)
+                        except Exception:
+                            st.warning("Could not read image file.")
                     else:
                         st.warning("The CSV references this image, but the image file is not available under the selected run root.")
         else:

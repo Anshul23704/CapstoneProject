@@ -8,16 +8,13 @@ import os
 import sys
 import threading
 import time
-import json
-import subprocess
 from datetime import datetime
 from queue import Empty, Queue
 from typing import List
 
+import config
 import cv2
 import pandas as pd
-
-import config
 from stage1_frame_ingestion      import FrameIngestionStage, FrameIngestionConfig
 from stage2_detection_tracking   import DetectionTrackingStage, DetectionConfig
 from plate_detection             import PlateDetectionStage, PlateDetectionConfig
@@ -68,6 +65,7 @@ def _result_consumer(
     rows: List[dict],
     raw_rows: List[dict],
     stats: dict,
+    crops_dir: str,
 ) -> None:
     """
     Runs on its own thread. Drains RecognitionResults from Stage 6's worker
@@ -89,6 +87,25 @@ def _result_consumer(
     stop_event alone isn't enough because workers may still be flushing
     their last results when shutdown begins.
     """
+    import cv2
+    import pandas as pd
+    
+    # Initialize incremental state
+    rich_file = open(RICH_CSV_PATH, "a", newline="", encoding="utf-8")
+    raw_file = open(RAW_CSV_PATH, "a", newline="", encoding="utf-8")
+    rich_writer = csv.DictWriter(rich_file, fieldnames=_RICH_FIELDS)
+    raw_writer = csv.DictWriter(raw_file, fieldnames=_RICH_FIELDS)
+    
+    best_detections = {}
+    valid_count = 0
+
+    try:
+        cap = cv2.VideoCapture(config.VIDEO_SOURCE)
+        fps = cap.get(cv2.CAP_PROP_FPS) or 30.0
+        cap.release()
+    except Exception:
+        fps = 30.0
+
     while True:
         try:
             result = result_q.get(timeout=0.5)
@@ -100,7 +117,6 @@ def _result_consumer(
         try:
             fused_text, fused_conf, is_valid = "", 0.0, False
             fused_b, conf_b = "", 0.0
-            fused_a, conf_a = "", 0.0
 
             if result.status == RecognitionStatus.SUCCESS and result.frame_readings:
                 readings_for_fusion = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings]
@@ -110,9 +126,7 @@ def _result_consumer(
                     r_b = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_bilateral]
                     fused_b, conf_b, _ = fusion.process(r_b)
 
-                if result.frame_readings_adaptive:
-                    r_a = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_adaptive]
-                    fused_a, conf_a, _ = fusion.process(r_a)
+
 
                 db.insert_result(
                     run_id=run_id,
@@ -126,8 +140,7 @@ def _result_consumer(
                     num_readings=len(result.frame_readings),
                     plate_text_bilateral=fused_b,
                     conf_bilateral=conf_b,
-                    plate_text_adaptive=fused_a,
-                    conf_adaptive=conf_a,
+
                     winner_branch=result.winner_branch,
                 )
 
@@ -135,7 +148,7 @@ def _result_consumer(
                     for (_t, _c, vehicle_bbox, plate_bbox_full, frame_idx) in result.frame_readings:
                         if plate_bbox_full is None:
                             continue
-                        row_dict = {
+                        row = {
                             "frame_nmr":                frame_idx,
                             "car_id":                   result.track_id,
                             "car_bbox":                 "[{} {} {} {}]".format(*vehicle_bbox),
@@ -144,10 +157,33 @@ def _result_consumer(
                             "license_number":           fused_text,
                             "license_number_score":     f"{fused_conf:.4f}",
                         }
-                        rows.append(row_dict)
-                        with open(RICH_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-                            csv.DictWriter(f, fieldnames=_RICH_FIELDS).writerow(row_dict)
+                        rows.append(row)
+                        rich_writer.writerow(row)
+                    rich_file.flush()
                     stats["fused_success"] += 1
+                    valid_count += 1
+                    
+                    # Track high confidence outputs live
+                    if fused_conf >= config.FINAL_OUTPUT_CONF_THRESHOLD:
+                        current_best = best_detections.get(result.track_id)
+                        if not current_best or fused_conf > float(current_best["Confidence"]):
+                            # get frame of best detection
+                            best_frame = result.frame_readings[0][4]
+                            sec = best_frame / fps
+                            ts = f"{int(sec//3600):02d}:{int((sec%3600)//60):02d}:{sec%60:06.3f}"
+                            
+                            context_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_context.png")
+                            plate_b_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_plate_bilateral.png")
+                            
+                            best_detections[result.track_id] = {
+                                "Track_ID":                  int(result.track_id),
+                                "License_Plate":             fused_text,
+                                "Confidence":                f"{fused_conf:.4f}",
+                                "Timestamp":                 ts,
+                                "Frame_Number":              best_frame,
+                                "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
+                                "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
+                            }
             else:
                 db.insert_result(
                     run_id=run_id,
@@ -178,38 +214,49 @@ def _result_consumer(
                     "license_number_score":     f"{score:.4f}",
                 }
                 raw_rows.append(raw_row)
-                with open(RAW_CSV_PATH, "a", newline="", encoding="utf-8") as f:
-                    csv.DictWriter(f, fieldnames=_RICH_FIELDS).writerow(raw_row)
+                raw_writer.writerow(raw_row)
+            raw_file.flush()
+            
+            # Periodically write Final_outputs and Preprocessing comparison
+            if valid_count > 0 and valid_count % 5 == 0:
+                final_outputs_csv = os.path.join(OUTPUT_DIR, "Final_outputs.csv")
+                final_outputs_md  = os.path.join(OUTPUT_DIR, "Final_outputs.md")
+                
+                high_conf_outputs = list(best_detections.values())
+                high_conf_outputs.sort(key=lambda x: (x["Frame_Number"], x["Track_ID"]))
+                
+                if high_conf_outputs:
+                    with open(final_outputs_csv, "w", newline="", encoding="utf-8") as f:
+                        writer = csv.DictWriter(f, fieldnames=list(high_conf_outputs[0].keys()))
+                        writer.writeheader()
+                        writer.writerows(high_conf_outputs)
+                    
+                    with open(final_outputs_md, "w", encoding="utf-8") as f:
+                        f.write(f"# High-Confidence License Plate Outputs — Run {RUN_ID}\\n\\n")
+                        f.write(f"**Confidence Threshold:** $\\\\ge {config.FINAL_OUTPUT_CONF_THRESHOLD:.2f}$ | **Total Verified Vehicles:** {len(high_conf_outputs)}\\n\\n")
+                        f.write("| Track ID | License Plate | Confidence | Timestamp | Frame | Context Image | Plate Crop |\\n")
+                        f.write("| :---: | :---: | :---: | :---: | :---: | :--- | :--- |\\n")
+                        for item in high_conf_outputs:
+                            ctx_link = f"[View Context ROI](file://{item['Context_Image_Path']})"
+                            plate_link = f"[View Plate](file://{item['Plate_Bilateral_Path']})"
+                            f.write(f"| **{item['Track_ID']}** | `{item['License_Plate']}` | **{item['Confidence']}** | `{item['Timestamp']}` | {item['Frame_Number']} | {ctx_link} | {plate_link} |\\n")
+                
+                db.dump_preprocessing_csv(run_id=run_id, output_dir=OUTPUT_DIR)
+                valid_count += 1  # prevent triggering multiple times for the same count
+                
         except Exception:
             logger.exception("result_consumer failed on job=%s track=%s",
                               result.job_id, result.track_id)
         finally:
             result_q.task_done()
+            
+    # Cleanup files
+    rich_file.close()
+    raw_file.close()
 
 
 def run() -> None:
     pipeline_start_time = time.time()
-    
-    # ── Initialize CSVs with headers for real-time updates ──
-    with open(RICH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=_RICH_FIELDS).writeheader()
-    with open(RAW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
-        csv.DictWriter(f, fieldnames=_RICH_FIELDS).writeheader()
-        
-    # ── Launch Streamlit GUI ──
-    gui_env = os.environ.copy()
-    gui_env["ALPR_RUN_ROOT"] = OUTPUT_DIR
-    gui_env["REFRESH_SECONDS"] = "2"
-    try:
-        gui_path = os.path.join(config.PROJECT_ROOT, "GUI", "app.py")
-        subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", gui_path],
-            env=gui_env
-        )
-        logger.info("Launched Streamlit GUI in background.")
-    except Exception as e:
-        logger.warning(f"Could not launch Streamlit GUI: {e}")
-
     logger.info("Loading models (vehicle=%s, plate=%s, device=%s)...",
                 config.VEHICLE_MODEL_PATH, config.PLATE_MODEL_PATH, config.DEVICE)
 
@@ -223,18 +270,11 @@ def run() -> None:
 
     job_creator = JobCreationStage(processing_queue, JobCreationConfig())
     crops_dir   = os.path.join(OUTPUT_DIR, "plate_crops")
-    high_conf_crops_dir = os.path.join(OUTPUT_DIR, "plate_crops_high_confidence")
     os.makedirs(crops_dir, exist_ok=True)
-    os.makedirs(high_conf_crops_dir, exist_ok=True)
     worker_pool = WorkerPoolStage(
         processing_queue, result_queue,
         num_workers=config.NUM_WORKERS,
-        config=WorkerConfig(
-            save_crops=True, 
-            crops_dir=crops_dir,
-            high_conf_crops_dir=high_conf_crops_dir,
-            high_conf_threshold=config.HIGH_CONF_CROP_THRESHOLD
-        ),
+        config=WorkerConfig(save_crops=True, crops_dir=crops_dir),
     )
     fusion = TemporalFusionStage(FusionConfig())
     db     = DatabaseAnalyticsStage(DatabaseConfig(db_path=DB_PATH))
@@ -243,11 +283,19 @@ def run() -> None:
     raw_rows: List[dict] = []
     stats = {"fused_success": 0, "no_plate": 0}
     stop_event = threading.Event()
+    
+    # Initialize CSV headers for live streaming
+    with open(RICH_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
+        writer.writeheader()
+    with open(RAW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
+        writer = csv.DictWriter(f, fieldnames=_RICH_FIELDS)
+        writer.writeheader()
 
     worker_pool.start()
     consumer_thread = threading.Thread(
         target=_result_consumer,
-        args=(result_queue, stop_event, fusion, db, RUN_ID, rows, raw_rows, stats),
+        args=(result_queue, stop_event, fusion, db, RUN_ID, rows, raw_rows, stats, crops_dir),
         daemon=True,
     )
     consumer_thread.start()
@@ -291,22 +339,6 @@ def run() -> None:
                 f"NoPlate:{stats['no_plate']}"
             )
             sys.stdout.flush()
-            
-            # Write status.json for GUI
-            try:
-                status_dict = {
-                    "frame_idx": frame_idx + 1,
-                    "total_frames": total_frames,
-                    "active_count": buffering.active_count,
-                    "finalized_count": finalized_count,
-                    "fused_success": stats["fused_success"],
-                    "no_plate": stats["no_plate"],
-                    "status": "running"
-                }
-                with open(os.path.join(OUTPUT_DIR, "status.json"), "w") as f:
-                    json.dump(status_dict, f)
-            except Exception:
-                pass
 
     print()
     logger.info("Ingestion complete. Flushing vehicles still active at stream end...")
@@ -397,18 +429,8 @@ def run() -> None:
                 ts = f"{int(sec//3600):02d}:{int((sec%3600)//60):02d}:{sec%60:06.3f}"
                 
                 # Check for existing crop images
-                # Use high confidence folder if the confidence meets the threshold
-                target_dir = high_conf_crops_dir if conf_val >= config.HIGH_CONF_CROP_THRESHOLD else crops_dir
-                
-                context_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
-                plate_b_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
-                plate_a_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
-                
-                # If they don't exist in high_conf_crops_dir for some reason, fallback to crops_dir
-                if not os.path.exists(context_f):
-                    context_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
-                    plate_b_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
-                    plate_a_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
+                context_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
+                plate_b_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
                 
                 high_conf_outputs.append({
                     "Track_ID":                  int(car_id),
@@ -418,7 +440,6 @@ def run() -> None:
                     "Frame_Number":              f_idx,
                     "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
                     "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
-                    "Plate_Adaptive_Path":       os.path.abspath(plate_a_f) if os.path.exists(plate_a_f) else plate_a_f,
                 })
 
     high_conf_outputs.sort(key=lambda x: (x["Frame_Number"], x["Track_ID"]))
@@ -489,16 +510,6 @@ def run() -> None:
     print(f"  Raw detections CSV      : {RAW_CSV_PATH}")
     print(f"  DB                      : {DB_PATH}")
     print("=" * 60)
-
-    try:
-        with open(os.path.join(OUTPUT_DIR, "status.json"), "r+") as f:
-            status_dict = json.load(f)
-            status_dict["status"] = "complete"
-            f.seek(0)
-            json.dump(status_dict, f)
-            f.truncate()
-    except Exception:
-        pass
 
 
 if __name__ == "__main__":
