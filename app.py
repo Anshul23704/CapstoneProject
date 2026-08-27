@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import os
 import sqlite3
+import json
 from pathlib import Path
 from typing import Optional
 
@@ -243,6 +244,30 @@ def metric_card(label: str, value: str, sub: str = "") -> None:
         unsafe_allow_html=True,
     )
 
+def read_live_status(run: Path) -> dict | None:
+    """
+    Read live pipeline status written by main_pipeline.py.
+
+    Returns None when this run does not have a status.json,
+    so older/static runs continue to work normally.
+    """
+    status_path = run / "status.json"
+
+    if not status_path.exists():
+        return None
+
+    try:
+        with open(status_path, "r", encoding="utf-8") as f:
+            data = json.load(f)
+
+        if not isinstance(data, dict):
+            return None
+
+        return data
+
+    except (OSError, json.JSONDecodeError):
+        return None
+
 # =============================================================================
 # Load selected run
 # =============================================================================
@@ -368,6 +393,81 @@ if page == "Dashboard":
         'the existing ALPR pipeline. During a new run, persisted artifacts are re-read automatically as they change.</div>',
         unsafe_allow_html=True,
     )
+
+    # ─────────────────────────────────────────────────────────────────────────────
+    # LIVE PIPELINE STATUS
+    # ─────────────────────────────────────────────────────────────────────────────
+
+    live_status = read_live_status(run)
+
+    if live_status is not None:
+        status = str(live_status.get("status", "")).lower()
+
+        frame_idx = int(live_status.get("frame_idx", 0) or 0)
+        total_frames = int(live_status.get("total_frames", 0) or 0)
+        active_count = int(live_status.get("active_count", 0) or 0)
+        finalized_count = int(live_status.get("finalized_count", 0) or 0)
+        fused_success = int(live_status.get("fused_success", 0) or 0)
+        no_plate = int(live_status.get("no_plate", 0) or 0)
+
+        if total_frames > 0:
+            progress = min(frame_idx / total_frames, 1.0)
+        else:
+            progress = 0.0
+
+        if status == "running":
+            st.markdown("### 🔴 Live Pipeline")
+
+            st.caption("Pipeline is currently processing this run.")
+
+            st.progress(
+                progress,
+                text=f"Processing frame {frame_idx:,} / {total_frames:,}"
+            )
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            with c1:
+                st.metric("Active Vehicles", f"{active_count:,}")
+
+            with c2:
+                st.metric("Finalized", f"{finalized_count:,}")
+
+            with c3:
+                st.metric("Successful OCR", f"{fused_success:,}")
+
+            with c4:
+                st.metric("No Plate", f"{no_plate:,}")
+
+        else:
+            st.markdown("### ✅ Pipeline Status")
+
+            if total_frames > 0:
+                st.progress(
+                    progress,
+                    text=f"Processed {frame_idx:,} / {total_frames:,} frames"
+                )
+
+            c1, c2, c3, c4 = st.columns(4)
+
+            with c1:
+                st.metric("Active Vehicles", f"{active_count:,}")
+
+            with c2:
+                st.metric("Finalized", f"{finalized_count:,}")
+
+            with c3:
+                st.metric("Successful OCR", f"{fused_success:,}")
+
+            with c4:
+                st.metric("No Plate", f"{no_plate:,}")
+
+    else:
+        # Older runs may not contain status.json.
+        st.info(
+            "Live pipeline status is unavailable for this run. "
+            "Showing persisted pipeline results."
+        )
 
     st.write("")
     st.subheader("Pipeline")
