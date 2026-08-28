@@ -22,10 +22,11 @@ load_dotenv()
 # ---------------------------------------------------------------------------
 # Configuration
 # ---------------------------------------------------------------------------
+
 APP_ROOT = Path(__file__).resolve().parent
-OUTPUT_ROOT = Path(os.getenv("ALPR_OUTPUT_ROOT", APP_ROOT / "sample_runs"))
+OUTPUT_ROOT = Path(os.getenv("ALPR_OUTPUT_ROOT", APP_ROOT.parent / "output")).resolve()
 RUN_ROOT_ENV = os.getenv("ALPR_RUN_ROOT", "").strip()
-REFRESH_SECONDS = max(1, int(os.getenv("REFRESH_SECONDS", "10")))
+REFRESH_SECONDS = max(1, int(os.getenv("REFRESH_SECONDS", "2")))
 AUTO_DISCOVER = os.getenv("AUTO_DISCOVER_RUNS", "true").lower() == "true"
 
 KNOWN_FILES = {
@@ -54,56 +55,93 @@ st.set_page_config(
 st.markdown(
     """
 <style>
+@import url('https://fonts.googleapis.com/css2?family=Inter:wght@300;400;600;800&family=Outfit:wght@400;600;800&display=swap');
+
 :root {
-  --bg:#0a0f14; --panel:#101821; --panel2:#131e29; --border:#263443;
-  --text:#eef4f8; --muted:#91a0ae; --blue:#67b7ff; --green:#5be08a;
-  --amber:#f4c66d; --red:#ff7788;
+  --bg: #07090e; --panel: rgba(16, 24, 33, 0.65); --panel-hover: rgba(22, 33, 46, 0.85); --border: rgba(38, 52, 67, 0.5);
+  --text: #eef4f8; --muted: #91a0ae; --blue: #00d2ff; --green: #00e676;
+  --amber: #ffca28; --red: #ff5252;
 }
-[data-testid="stAppViewContainer"] { background:var(--bg); }
-[data-testid="stSidebar"] { background:#0d141c; border-right:1px solid var(--border); }
-.block-container { max-width:1500px; padding-top:1.4rem; padding-bottom:4rem; }
-h1,h2,h3 { letter-spacing:-.025em; }
-.small { color:var(--muted); font-size:.82rem; }
-.eyebrow { color:var(--blue); font-size:.72rem; font-weight:800; letter-spacing:.14em; text-transform:uppercase; }
+* { font-family: 'Inter', sans-serif; }
+h1, h2, h3, .metric-value, .big-plate, .stage-title { font-family: 'Outfit', sans-serif; letter-spacing: -0.02em; }
+[data-testid="stAppViewContainer"] { 
+    background: radial-gradient(circle at top right, #111a28, #07090e 60%); 
+}
+[data-testid="stSidebar"] { 
+    background: rgba(10, 15, 22, 0.8) !important; 
+    backdrop-filter: blur(12px); 
+    border-right: 1px solid var(--border); 
+}
+.block-container { max-width: 1500px; padding-top: 2rem; padding-bottom: 4rem; }
+.small { color: var(--muted); font-size: 0.85rem; }
+.eyebrow { 
+    color: var(--blue); font-size: 0.75rem; font-weight: 800; letter-spacing: 0.2em; text-transform: uppercase;
+    text-shadow: 0 0 10px rgba(0, 210, 255, 0.4);
+}
 .card {
-  background:linear-gradient(145deg,var(--panel),#0d151e);
-  border:1px solid var(--border); border-radius:15px; padding:17px 19px;
-  min-height:105px;
+  background: var(--panel);
+  backdrop-filter: blur(10px); -webkit-backdrop-filter: blur(10px);
+  border: 1px solid var(--border); border-radius: 16px; padding: 20px;
+  min-height: 110px; height: 100%; box-sizing: border-box;
+  box-shadow: 0 8px 32px 0 rgba(0, 0, 0, 0.3);
+  transition: transform 0.3s cubic-bezier(0.175, 0.885, 0.32, 1.275), border-color 0.3s ease, box-shadow 0.3s ease;
 }
-.metric-label { color:var(--muted); font-size:.72rem; text-transform:uppercase; letter-spacing:.09em; }
-.metric-value { color:var(--text); font-size:1.72rem; font-weight:800; margin-top:4px; }
-.metric-sub { color:var(--muted); font-size:.76rem; margin-top:3px; }
+.card:hover {
+    transform: translateY(-5px); border-color: rgba(0, 210, 255, 0.4);
+    box-shadow: 0 12px 40px 0 rgba(0, 210, 255, 0.15);
+}
+.metric-label { color: var(--muted); font-size: 0.75rem; text-transform: uppercase; letter-spacing: 0.1em; font-weight: 600;}
+.metric-value { 
+    color: var(--text); font-size: 2rem; font-weight: 800; margin-top: 6px;
+    background: linear-gradient(90deg, #fff, #b3d4ff);
+    -webkit-background-clip: text; -webkit-text-fill-color: transparent;
+}
+.metric-sub { color: var(--muted); font-size: 0.8rem; margin-top: 4px; }
 .pill {
-  display:inline-block; padding:4px 9px; border-radius:999px;
-  font-size:.72rem; font-weight:800; border:1px solid var(--border);
-  background:#15212c; color:#cbd7e1;
+  display: inline-flex; align-items: center; justify-content: center; padding: 6px 12px; border-radius: 999px;
+  font-size: 0.75rem; font-weight: 800; border: 1px solid var(--border);
+  background: rgba(21, 33, 44, 0.8); color: #cbd7e1;
+  box-shadow: 0 2px 10px rgba(0,0,0,0.2); backdrop-filter: blur(5px);
 }
-.pill-green { background:#123022; color:#78e6a0; border-color:#1d5136; }
-.pill-amber { background:#322712; color:#f2cb77; border-color:#5b451c; }
-.pill-blue { background:#102b42; color:#91d0ff; border-color:#1c4e72; }
-.pill-red { background:#351820; color:#ff9aaa; border-color:#5b2732; }
+.pill-green { background: rgba(0, 230, 118, 0.1); color: #00e676; border-color: rgba(0, 230, 118, 0.3); box-shadow: 0 0 10px rgba(0, 230, 118, 0.2); }
+.pill-amber { background: rgba(255, 202, 40, 0.1); color: #ffca28; border-color: rgba(255, 202, 40, 0.3); box-shadow: 0 0 10px rgba(255, 202, 40, 0.2); }
+.pill-blue { background: rgba(0, 210, 255, 0.1); color: #00d2ff; border-color: rgba(0, 210, 255, 0.3); box-shadow: 0 0 10px rgba(0, 210, 255, 0.2); }
+.pill-red { background: rgba(255, 82, 82, 0.1); color: #ff5252; border-color: rgba(255, 82, 82, 0.3); box-shadow: 0 0 10px rgba(255, 82, 82, 0.2); }
 .stage {
-  border:1px solid var(--border); border-radius:13px; background:var(--panel);
-  padding:13px 11px; min-height:88px;
+  border: 1px solid var(--border); border-radius: 14px; background: var(--panel);
+  padding: 16px; min-height: 95px; height: 100%; box-sizing: border-box;
+  transition: all 0.3s ease; backdrop-filter: blur(10px);
 }
-.stage-title { font-weight:800; font-size:.80rem; }
-.stage-meta { color:var(--muted); font-size:.68rem; margin-top:5px; line-height:1.35; }
-.stage-dot { font-size:.65rem; margin-right:5px; }
+.stage:hover { background: var(--panel-hover); border-color: rgba(255,255,255,0.2); }
+.stage-title { font-weight: 800; font-size: 0.85rem; color: #fff; }
+.stage-meta { color: var(--muted); font-size: 0.75rem; margin-top: 6px; line-height: 1.4; }
 .callout {
-  border-left:3px solid var(--blue); background:#0e1923; padding:12px 15px;
-  border-radius:7px; color:#c2ced8;
+  border-left: 4px solid var(--blue); background: linear-gradient(90deg, rgba(0, 210, 255, 0.1), transparent);
+  padding: 16px 20px; border-radius: 0 10px 10px 0; color: #d1e0ec; font-size: 0.9rem;
 }
 .evidence {
-  background:#0d151e; border:1px solid var(--border); border-radius:14px;
-  padding:15px;
+  background: var(--panel); border: 1px solid var(--border); border-radius: 16px;
+  padding: 20px; text-align: center; backdrop-filter: blur(10px);
+  height: 100%; box-sizing: border-box;
 }
-.big-plate { font-size:1.55rem; font-weight:850; letter-spacing:.05em; }
+.big-plate { 
+    font-size: 1.8rem; font-weight: 800; letter-spacing: 0.1em; color: #fff; 
+    margin: 10px 0; text-shadow: 0 0 15px rgba(255,255,255,0.2);
+}
 .trace {
-  background:#0c131a; border:1px solid var(--border); border-radius:10px;
-  padding:10px 12px; font-family:ui-monospace,SFMono-Regular,Menlo,monospace;
-  font-size:.78rem;
+  background: rgba(0,0,0,0.3); border: 1px solid var(--border); border-radius: 8px;
+  padding: 12px 16px; font-family: 'SFMono-Regular', Consolas, 'Liberation Mono', Menlo, monospace;
+  font-size: 0.8rem; color: #a1b0c0;
 }
-hr { border-color:var(--border); }
+.progress-container { width: 100%; background-color: #1a242f; border-radius: 999px; overflow: hidden; height: 12px; margin-top: 15px; box-shadow: inset 0 1px 3px rgba(0,0,0,0.3); }
+.progress-bar { height: 100%; background: linear-gradient(90deg, #00d2ff, #3a7bd5); transition: width 0.4s ease; box-shadow: 0 0 10px rgba(0,210,255,0.5); }
+.status-flex { display: flex; justify-content: space-between; align-items: center; margin-top: 20px; }
+hr { border-color: var(--border); margin: 2rem 0; }
+@keyframes pulse {
+  0% { box-shadow: 0 0 0 0 rgba(0, 210, 255, 0.4); }
+  70% { box-shadow: 0 0 0 10px rgba(0, 210, 255, 0); }
+  100% { box-shadow: 0 0 0 0 rgba(0, 210, 255, 0); }
+}
 </style>
 """,
     unsafe_allow_html=True,
@@ -180,7 +218,12 @@ def metric_card(label, value, sub=""):
 @st.cache_data(show_spinner=False)
 def read_csv(path_str: str, mtime: float) -> pd.DataFrame:
     p = Path(path_str)
-    return pd.read_csv(p) if p.exists() else pd.DataFrame()
+    if not p.exists():
+        return pd.DataFrame()
+    df = pd.read_csv(p)
+    for col in df.select_dtypes(include=['object']).columns:
+        df[col] = df[col].astype("string")
+    return df
 
 @st.cache_data(show_spinner=False)
 def read_db(path_str: str, mtime: float) -> pd.DataFrame:
@@ -195,7 +238,10 @@ def read_db(path_str: str, mtime: float) -> pd.DataFrame:
         )["name"].tolist()
         if "ocr_results" not in tables:
             return pd.DataFrame()
-        return pd.read_sql_query("SELECT * FROM ocr_results", con)
+        df = pd.read_sql_query("SELECT * FROM ocr_results", con)
+        for col in df.select_dtypes(include=['object']).columns:
+            df[col] = df[col].astype("string")
+        return df
     finally:
         con.close()
 
@@ -271,6 +317,17 @@ def artifact_inventory(run: Path) -> pd.DataFrame:
         rows.append({"artifact": d + "/", "purpose": "images", "status": "AVAILABLE" if p.exists() else "MISSING", "size": f"{count} files", "modified": "—"})
     return pd.DataFrame(rows)
 
+def read_status(run: Path) -> dict:
+    p = run / "status.json"
+    if p.exists():
+        try:
+            import json
+            with open(p, "r") as f:
+                return json.load(f)
+        except Exception:
+            pass
+    return {}
+
 # ---------------------------------------------------------------------------
 # Run selection
 # ---------------------------------------------------------------------------
@@ -296,7 +353,7 @@ with st.sidebar:
 
     page = st.radio(
         "Explore",
-        ["Overview", "Pipeline", "Vehicles", "Evidence", "Analytics", "Run Artifacts"],
+        ["Overview", "Pipeline", "Vehicles", "Run Artifacts"],
         label_visibility="collapsed",
     )
     st.divider()
@@ -343,35 +400,33 @@ if page == "Overview":
         unsafe_allow_html=True,
     )
     st.write("")
+    
+    status_data = read_status(run)
+    is_running = status_data.get("status") == "running"
+    
+    if is_running:
+        pct = min(100, (status_data.get('frame_idx', 0) / max(status_data.get('total_frames', 1), 1)) * 100)
+        st.markdown(f"""
+        <div class="card" style="margin-bottom: 2rem; border-color: #00d2ff; animation: pulse 2s infinite;">
+            <div class="eyebrow" style="margin-bottom: 5px;"><span class="pill pill-blue" style="margin-right: 10px;">LIVE</span> Pipeline is running</div>
+            <div class="status-flex">
+                <div>
+                    <div style="font-family: 'Outfit'; font-size: 1.5rem; font-weight: 600; color: #fff;">Processing Frame {status_data.get('frame_idx', 0):,} / {status_data.get('total_frames', 0):,}</div>
+                </div>
+                <div style="text-align: right;">
+                    <div class="small" style="color: #cbd7e1;">Active Vehicles: <b style="color: #fff;">{status_data.get('active_count', 0)}</b> | Finalized: <b style="color: #fff;">{status_data.get('finalized_count', 0)}</b></div>
+                </div>
+            </div>
+            <div class="progress-container">
+                <div class="progress-bar" style="width: {pct}%;"></div>
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
 
-    total_raw = len(raw)
-    raw_tracks = unique_count(raw, "car_id")
-    frames = unique_count(raw, "frame_nmr")
     jobs = len(db)
     successes = len(success_df())
-    final_n = len(final)
-    rich_tracks = unique_count(rich, "car_id")
     interp_rows = len(interp)
-
-    cols = st.columns(6)
-    for c, label, value, sub in [
-        (cols[0], "Raw detection records", fmt_num(total_raw), f"{raw_tracks} track IDs"),
-        (cols[1], "Frames represented", fmt_num(frames), "raw detection artifact"),
-        (cols[2], "Recognition jobs", fmt_num(jobs), f"{successes} SUCCESS"),
-        (cols[3], "Successful jobs", fmt_num(successes), f"{jobs-successes} NO_PLATE"),
-        (cols[4], "Final outputs", fmt_num(final_n), "Final_outputs.csv"),
-        (cols[5], "Interpolated rows", fmt_num(interp_rows), f"{rich_tracks} rich tracks"),
-    ]:
-        with c:
-            metric_card(label, value, sub)
-
-    st.write("")
-    st.markdown(
-        '<div class="callout"><b>What this console is:</b> a run-agnostic investigation layer over the '
-        'existing pipeline artifacts. It does not run or modify YOLO/OCR/tracking. Values are either '
-        'read directly from persisted artifacts or explicitly derived from them.</div>',
-        unsafe_allow_html=True,
-    )
+    raw_tracks = unique_count(raw, "car_id")
 
     st.write("")
     st.subheader("Recognition funnel")
@@ -566,7 +621,8 @@ elif page == "Pipeline":
                     "confidence",
                     "plate_text_bilateral",
                     "conf_bilateral",
-
+                    "plate_text_adaptive",
+                    "conf_adaptive",
                     "winner_branch",
                     "stitched_track_ids"
                 ]
@@ -620,10 +676,12 @@ elif page == "Vehicles":
     raw_ids = set(raw["car_id"].dropna().astype(int)) if "car_id" in raw else set()
     db_ids = set(pd.to_numeric(db["track_id"], errors="coerce").dropna().astype(int)) if "track_id" in db else set()
     final_ids = set(pd.to_numeric(final["Track_ID"], errors="coerce").dropna().astype(int)) if "Track_ID" in final else set()
-    ids = sorted(raw_ids | db_ids | final_ids)
+    
+    # Restrict to only high-confidence final outputs per user request
+    ids = sorted(final_ids)
 
     if not ids:
-        st.warning("No track IDs are available.")
+        st.warning("No high-confidence track IDs are available in Final_outputs.csv.")
     else:
         selected = st.selectbox("Track ID", ids)
         raw_t = raw[raw["car_id"] == selected].copy() if "car_id" in raw else pd.DataFrame()
@@ -652,13 +710,27 @@ elif page == "Vehicles":
         if not db_t.empty:
             st.subheader("Recognition chain")
             for _, r in db_t.iterrows():
-                cols = st.columns(3)
+                # Big Plate Visualizations for this job
+                ev_cols = st.columns(3)
+                for col, label, text_field, conf_field in [
+                    (ev_cols[0], "BILATERAL", "plate_text_bilateral", "conf_bilateral"),
+                    (ev_cols[1], "ADAPTIVE", "plate_text_adaptive", "conf_adaptive"),
+                    (ev_cols[2], "FUSION", "plate_text", "confidence"),
+                ]:
+                    with col:
+                        st.markdown(f'<div class="evidence"><b>{label}</b><div class="big-plate">{r.get(text_field) or "—"}</div><span class="small">confidence {float(r.get(conf_field,0)):.4f}</span></div>', unsafe_allow_html=True)
+                
+                st.write("")
+                # Detailed Breakdown
+                cols = st.columns(4)
                 with cols[0]:
                     metric_card("Status", str(r.get("status", "—")), f"job {str(r.get('job_id','—'))[:8]}")
                 with cols[1]:
                     metric_card("Fusion", str(r.get("plate_text") or "—"), f"confidence {float(r.get('confidence',0)):.4f}")
                 with cols[2]:
                     metric_card("Bilateral", str(r.get("plate_text_bilateral") or "—"), f"{float(r.get('conf_bilateral',0)):.4f}")
+                with cols[3]:
+                    metric_card("Adaptive", str(r.get("plate_text_adaptive") or "—"), f"{float(r.get('conf_adaptive',0)):.4f}")
                 st.markdown(
                     f'<div class="trace">winner={r.get("winner_branch","—")} · '
                     f'readings={r.get("num_readings","—")} · '
@@ -667,6 +739,7 @@ elif page == "Vehicles":
                     f'possible_id_switch={r.get("possible_id_switch","—")}</div>',
                     unsafe_allow_html=True,
                 )
+                st.divider()
 
         st.subheader("Recognition evidence files")
         if not final_t.empty:
@@ -680,221 +753,18 @@ elif page == "Vehicles":
                 p = find_artifact_image(run, row.get(field))
                 with col:
                     st.markdown(f"**{label}**")
-                    if p:
-                        st.image(str(p), width="stretch", caption=p.name)
+                    if p and p.exists():
+                        try:
+                            with open(p, "rb") as f:
+                                st.image(f.read(), width="stretch", caption=p.name)
+                        except Exception:
+                            st.warning("Could not read image file.")
                     else:
                         st.info("Image not found in this run directory.")
 
         if not rich_t.empty:
             st.subheader("Frame-level rich records")
             st.dataframe(rich_t, width="stretch", hide_index=True)
-
-# ---------------------------------------------------------------------------
-# Evidence
-# ---------------------------------------------------------------------------
-elif page == "Evidence":
-    st.markdown('<div class="eyebrow">EVIDENCE INSPECTOR</div>', unsafe_allow_html=True)
-    st.title("Recognition Evidence")
-    s = success_df()
-    if s.empty:
-        st.info("No SUCCESS recognition records are available.")
-    else:
-        options = s.apply(lambda r: f"Track {int(r.track_id)} · {r.plate_text} · {float(r.confidence):.4f}", axis=1).tolist()
-        idx = st.selectbox("Recognition record", range(len(options)), format_func=lambda i: options[i])
-        row = s.iloc[idx]
-
-        c = st.columns(4)
-        with c[0]: metric_card("Final plate", str(row.plate_text or "—"))
-        with c[1]: metric_card("Fused confidence", f"{float(row.confidence):.4f}")
-        with c[2]: metric_card("Winner", str(row.winner_branch))
-        with c[3]: metric_card("Readings", fmt_num(row.num_readings))
-
-        st.write("")
-        cols = st.columns(2)
-        for col, label, text_field, conf_field in [
-            (cols[0], "BILATERAL", "plate_text_bilateral", "conf_bilateral"),
-            (cols[1], "FUSION", "plate_text", "confidence"),
-        ]:
-            with col:
-                st.markdown(f'<div class="evidence"><b>{label}</b><div class="big-plate">{row.get(text_field) or "—"}</div><span class="small">confidence {float(row.get(conf_field,0)):.4f}</span></div>', unsafe_allow_html=True)
-
-        st.write("")
-        final_t = final[pd.to_numeric(final["Track_ID"], errors="coerce") == int(row.track_id)] if not final.empty else pd.DataFrame()
-        if not final_t.empty:
-            r = final_t.iloc[0]
-            st.subheader("Actual image evidence")
-            cols = st.columns(2)
-            for col, label, field in [
-                (cols[0], "Context frame", "Context_Image_Path"),
-                (cols[1], "Bilateral crop", "Plate_Bilateral_Path"),
-            ]:
-                p = find_artifact_image(run, r.get(field))
-                with col:
-                    st.markdown(f"**{label}**")
-                    if p:
-                        st.image(str(p), width="stretch", caption=p.name)
-                    else:
-                        st.warning("The CSV references this image, but the image file is not available under the selected run root.")
-        else:
-            st.info("Final_outputs.csv does not contain this track; therefore no image paths are available from that artifact.")
-
-        st.subheader("Raw persisted recognition record")
-        st.dataframe(row.to_frame("value"), width="stretch")
-
-# ---------------------------------------------------------------------------
-# Analytics
-# ---------------------------------------------------------------------------
-elif page == "Analytics":
-    st.markdown('<div class="eyebrow">RESEARCH ANALYTICS</div>', unsafe_allow_html=True)
-    st.title("Run Analytics")
-    s = success_df()
-
-    # Funnel
-    st.subheader("1 · Recognition funnel")
-    if not db.empty:
-        funnel_df = pd.DataFrame({
-            "stage": ["Recognition jobs", "SUCCESS", "Final outputs"],
-            "count": [len(db), len(s), len(final)],
-        }).set_index("stage")
-        st.bar_chart(funnel_df, y="count", height=280)
-
-    # Preprocessing
-    st.subheader("2 · Preprocessing branch behaviour")
-    if not prep.empty:
-        successful_p = prep[prep["status"] == "SUCCESS"].copy()
-        winner_counts = successful_p["winner_branch"].value_counts()
-        cols = st.columns(2)
-        with cols[0]: metric_card("Successful jobs", fmt_num(len(successful_p)))
-        with cols[1]: metric_card("Bilateral wins", fmt_num(int((successful_p["winner_branch"]=="bilateral").sum())))
-        st.bar_chart(winner_counts, height=260)
-        st.caption("Winner labels are read from results_preprocessing_comparison.csv; no accuracy claim is implied.")
-
-    # Temporal evidence
-    st.subheader("3 · Temporal evidence")
-
-    # Reading counts are persisted in the preprocessing-comparison artifact,
-    # not necessarily in the SQLite schema. Do not assume the two schemas match.
-    if not prep.empty and "num_readings" in prep.columns:
-
-        temporal = prep.copy()
-
-        if "status" in temporal.columns:
-            temporal = temporal[
-                temporal["status"].astype(str).str.upper() == "SUCCESS"
-            ].copy()
-
-        readings = pd.to_numeric(
-            temporal["num_readings"],
-            errors="coerce"
-        ).dropna()
-
-        if not readings.empty:
-
-            cols = st.columns(4)
-
-            with cols[0]:
-                metric_card(
-                    "Successful jobs",
-                    fmt_num(len(readings))
-                )
-
-            with cols[1]:
-                metric_card(
-                    "Mean readings",
-                    f"{readings.mean():.2f}"
-                )
-
-            with cols[2]:
-                metric_card(
-                    "Median readings",
-                    f"{readings.median():.1f}"
-                )
-
-            with cols[3]:
-                metric_card(
-                    "Maximum readings",
-                    fmt_num(readings.max())
-                )
-
-            counts = (
-                readings
-                .astype(int)
-                .value_counts()
-                .sort_index()
-            )
-
-            st.bar_chart(
-                counts,
-                height=250
-            )
-
-            st.caption(
-                "Descriptive evidence from the persisted preprocessing "
-                "comparison artifact. This does not by itself establish "
-                "that additional readings improve recognition accuracy."
-            )
-
-        else:
-            st.info(
-                "The preprocessing artifact exists, but contains no "
-                "usable reading-count values for SUCCESS records."
-            )
-
-    else:
-        st.info(
-            "Temporal reading counts are unavailable because "
-            "results_preprocessing_comparison.csv does not expose "
-            "a num_readings column in this run."
-        )
-
-        # Confidence comparison
-        st.subheader("4 · Confidence comparison")
-        if not prep.empty:
-            comp = prep[prep["status"]=="SUCCESS"][["track_id","conf_bilateral","confidence"]].copy()
-            comp = comp.set_index("track_id")
-            st.line_chart(comp, height=300)
-
-        # Trajectory expansion
-        st.subheader("5 · Trajectory interpolation")
-        if not rich.empty and not interp.empty:
-            ratio = len(interp) / len(rich)
-            c = st.columns(3)
-            with c[0]: metric_card("Original rich rows", fmt_num(len(rich)))
-            with c[1]: metric_card("Interpolated rows", fmt_num(len(interp)))
-            with c[2]: metric_card("Row multiplier", f"{ratio:.2f}×")
-            track_options = sorted(interp["car_id"].dropna().astype(int).unique()) if "car_id" in interp else []
-            if track_options:
-                tid = st.selectbox("Trajectory track", track_options, key="trajectory_track")
-                rt = rich[rich["car_id"] == tid].copy()
-                it = interp[interp["car_id"] == tid].copy()
-                if not rt.empty:
-                    st.caption(f"Track {tid}: raw observations vs interpolated trajectory.")
-                    chart = pd.DataFrame({
-                        "raw": pd.Series(rt["frame_nmr"].values),
-                        "interpolated": pd.Series(it["frame_nmr"].head(len(rt)).values),
-                    })
-                    # Keep the chart simple and honest; the detailed records are below.
-                    st.dataframe(pd.concat([
-                        rt.assign(source="raw"),
-                        it.assign(source="interpolated")
-                    ], ignore_index=True).head(500), width="stretch", hide_index=True)
-
-        st.subheader("6 · Failure / quality flags")
-        if not db.empty:
-            c = st.columns(3)
-            low = int(pd.to_numeric(db["low_diversity"], errors="coerce").fillna(0).astype(bool).sum()) if "low_diversity" in db else 0
-            switch = int(pd.to_numeric(db["possible_id_switch"], errors="coerce").fillna(0).astype(bool).sum()) if "possible_id_switch" in db else 0
-            no_plate = int((db["status"]=="NO_PLATE").sum()) if "status" in db else 0
-            with c[0]: metric_card("NO_PLATE jobs", fmt_num(no_plate))
-            with c[1]: metric_card("Low-diversity flags", fmt_num(low))
-            with c[2]: metric_card("Possible ID-switch flags", fmt_num(switch))
-
-        st.markdown(
-            '<div class="callout"><b>Research boundary:</b> this console deliberately does not display '
-            'accuracy, precision, recall, character accuracy, or improvement percentages because the supplied '
-            'run contains no ground-truth annotation artifact. Those belong in the later controlled evaluation layer.</div>',
-            unsafe_allow_html=True,
-        )
 
 # ---------------------------------------------------------------------------
 # Run artifacts

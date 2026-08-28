@@ -146,3 +146,4 @@ MIN_READINGS_FOR_FUSION = 2
 
 # ── Final Outputs Filtering ───────────────────────────────────────────────────
 FINAL_OUTPUT_CONF_THRESHOLD = 0.20  # Minimum confidence required for high-confidence final output table
+HIGH_CONF_CROP_THRESHOLD = 0.40     # Threshold for routing plate crops to the high confidence folder

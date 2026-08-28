@@ -154,6 +154,8 @@ class WorkerConfig:
     blur_threshold:   float = config.BLUR_THRESHOLD
     save_crops:       bool  = True
     crops_dir:        Optional[str] = None
+    high_conf_crops_dir: Optional[str] = None
+    high_conf_threshold: float = 0.40
 
 
 class Worker(threading.Thread):
@@ -254,9 +256,12 @@ class Worker(threading.Thread):
             # 4. Save enhanced crop and comparison context image
             if self.cfg.save_crops and self.cfg.crops_dir:
                 try:
-                    os.makedirs(self.cfg.crops_dir, exist_ok=True)
+                    # Decide which directory to use based on confidence
+                    target_dir = self.cfg.high_conf_crops_dir if (self.cfg.high_conf_crops_dir and conf_b >= self.cfg.high_conf_threshold) else self.cfg.crops_dir
+                    
+                    os.makedirs(target_dir, exist_ok=True)
                     prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
-                    cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_plate_bilateral.png"), plate_bilateral)
+                    cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_bilateral.png"), plate_bilateral)
 
                     roi = frame_entry.full_frame
                     if roi is not None and roi.size > 0:
@@ -273,7 +278,7 @@ class Worker(threading.Thread):
                         lbl_b = f"Bilateral: {text_b} ({conf_b:.2f})" if text_b else "Bilateral: --"
                         cv2.putText(context_img, lbl_b, (lx1, max(18, ly1 - 18)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
-                        cv2.imwrite(os.path.join(self.cfg.crops_dir, f"{prefix}_context.png"), context_img)
+                        cv2.imwrite(os.path.join(target_dir, f"{prefix}_context.png"), context_img)
                 except Exception as exc:
                     logger.debug("Failed saving crop image: %s", exc)
 

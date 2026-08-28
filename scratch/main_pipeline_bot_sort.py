@@ -7,6 +7,7 @@ import logging
 import os
 import sys
 import threading
+import time
 from datetime import datetime
 from queue import Empty, Queue
 from typing import List
@@ -171,14 +172,8 @@ def _result_consumer(
                             sec = best_frame / fps
                             ts = f"{int(sec//3600):02d}:{int((sec%3600)//60):02d}:{sec%60:06.3f}"
                             
-                            # Determine target directory
-                            target_dir = crops_dir
-                            high_conf_crops_dir = os.path.join(OUTPUT_DIR, "plate_crops_high_confidence")
-                            if fused_conf >= config.HIGH_CONF_CROP_THRESHOLD and os.path.exists(high_conf_crops_dir):
-                                target_dir = high_conf_crops_dir
-                            
-                            context_f = os.path.join(target_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_context.png")
-                            plate_b_f = os.path.join(target_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_plate_bilateral.png")
+                            context_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_context.png")
+                            plate_b_f = os.path.join(crops_dir, f"track_{int(result.track_id):03d}_frame_{best_frame:04d}_plate_bilateral.png")
                             
                             best_detections[result.track_id] = {
                                 "Track_ID":                  int(result.track_id),
@@ -261,24 +256,7 @@ def _result_consumer(
 
 
 def run() -> None:
-    import time
-    import json
-    import subprocess
-    
-    # ── Launch Streamlit GUI ──
-    gui_env = os.environ.copy()
-    gui_env["ALPR_RUN_ROOT"] = OUTPUT_DIR
-    gui_env["REFRESH_SECONDS"] = "2"
-    try:
-        gui_path = os.path.join(config.PROJECT_ROOT, "GUI", "app.py")
-        subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", gui_path],
-            env=gui_env
-        )
-        logger.info("Launched Streamlit GUI in background.")
-    except Exception as e:
-        logger.warning(f"Could not launch Streamlit GUI: {e}")
-
+    pipeline_start_time = time.time()
     logger.info("Loading models (vehicle=%s, plate=%s, device=%s)...",
                 config.VEHICLE_MODEL_PATH, config.PLATE_MODEL_PATH, config.DEVICE)
 
@@ -292,18 +270,11 @@ def run() -> None:
 
     job_creator = JobCreationStage(processing_queue, JobCreationConfig())
     crops_dir   = os.path.join(OUTPUT_DIR, "plate_crops")
-    high_conf_crops_dir = os.path.join(OUTPUT_DIR, "plate_crops_high_confidence")
     os.makedirs(crops_dir, exist_ok=True)
-    os.makedirs(high_conf_crops_dir, exist_ok=True)
     worker_pool = WorkerPoolStage(
         processing_queue, result_queue,
         num_workers=config.NUM_WORKERS,
-        config=WorkerConfig(
-            save_crops=True, 
-            crops_dir=crops_dir,
-            high_conf_crops_dir=high_conf_crops_dir,
-            high_conf_threshold=config.HIGH_CONF_CROP_THRESHOLD
-        ),
+        config=WorkerConfig(save_crops=True, crops_dir=crops_dir),
     )
     fusion = TemporalFusionStage(FusionConfig())
     db     = DatabaseAnalyticsStage(DatabaseConfig(db_path=DB_PATH))
@@ -368,23 +339,6 @@ def run() -> None:
                 f"NoPlate:{stats['no_plate']}"
             )
             sys.stdout.flush()
-            
-            # Write status.json for GUI
-            try:
-                status_dict = {
-                    "frame_idx": frame_idx + 1,
-                    "total_frames": total_frames,
-                    "active_count": buffering.active_count,
-                    "finalized_count": finalized_count,
-                    "fused_success": stats["fused_success"],
-                    "no_plate": stats["no_plate"],
-                    "status": "running"
-                }
-                with open(os.path.join(OUTPUT_DIR, "status.json"), "w") as f:
-                    json.dump(status_dict, f)
-            except Exception:
-                pass
-
 
     print()
     logger.info("Ingestion complete. Flushing vehicles still active at stream end...")
@@ -529,6 +483,20 @@ def run() -> None:
     else:
         logger.warning("No raw detections at all — skipping Stage 10 video render")
 
+    # ── Final Metrics ────────────────────────────────────────────────────────
+    pipeline_end_time = time.time()
+    processing_time = pipeline_end_time - pipeline_start_time
+    try:
+        from final_metrics import generate_metrics_report
+        generate_metrics_report(
+            run_dir=OUTPUT_DIR,
+            processing_time=processing_time,
+            total_frames=total_frames,
+            fps=fps
+        )
+    except Exception:
+        logger.exception("Failed to generate research metrics")
+
     unique_plates = {row["license_number"] for row in rows}
     print("\n" + "=" * 60)
     print(f"  PIPELINE COMPLETE — {RUN_ID}")
@@ -543,15 +511,6 @@ def run() -> None:
     print(f"  DB                      : {DB_PATH}")
     print("=" * 60)
 
-    try:
-        with open(os.path.join(OUTPUT_DIR, "status.json"), "r+") as f:
-            status_dict = json.load(f)
-            status_dict["status"] = "complete"
-            f.seek(0)
-            json.dump(status_dict, f)
-            f.truncate()
-    except Exception:
-        pass
 
 if __name__ == "__main__":
     run()
