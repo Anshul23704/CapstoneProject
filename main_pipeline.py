@@ -141,6 +141,7 @@ def _result_consumer(
                     conf_bilateral=conf_b,
 
                     winner_branch=result.winner_branch,
+                    avg_sharpness=result.avg_sharpness,
                 )
 
                 if is_valid and fused_text:
