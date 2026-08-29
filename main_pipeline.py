@@ -184,6 +184,7 @@ def _result_consumer(
                                 "Track_ID":                  int(result.track_id),
                                 "License_Plate":             fused_text,
                                 "Confidence":                f"{fused_conf:.4f}",
+                                "Avg_Sharpness":             f"{result.avg_sharpness:.2f}",
                                 "Timestamp":                 ts,
                                 "Frame_Number":              best_frame,
                                 "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
@@ -200,6 +201,7 @@ def _result_consumer(
                     is_valid=False,
                     num_readings=len(result.frame_readings),
                     winner_branch=result.winner_branch,
+                    avg_sharpness=result.avg_sharpness,
                 )
                 stats["no_plate"] += 1
 
@@ -239,12 +241,12 @@ def _result_consumer(
                     with open(final_outputs_md, "w", encoding="utf-8") as f:
                         f.write(f"# High-Confidence License Plate Outputs — Run {RUN_ID}\\n\\n")
                         f.write(f"**Confidence Threshold:** $\\\\ge {config.FINAL_OUTPUT_CONF_THRESHOLD:.2f}$ | **Total Verified Vehicles:** {len(high_conf_outputs)}\\n\\n")
-                        f.write("| Track ID | License Plate | Confidence | Timestamp | Frame | Context Image | Plate Crop |\\n")
-                        f.write("| :---: | :---: | :---: | :---: | :---: | :--- | :--- |\\n")
+                        f.write("| Track ID | License Plate | Confidence | Avg Sharpness | Timestamp | Frame | Context Image | Plate Crop |\\n")
+                        f.write("| :---: | :---: | :---: | :---: | :---: | :---: | :--- | :--- |\\n")
                         for item in high_conf_outputs:
                             ctx_link = f"[View Context ROI](file://{item['Context_Image_Path']})"
                             plate_link = f"[View Plate](file://{item['Plate_Bilateral_Path']})"
-                            f.write(f"| **{item['Track_ID']}** | `{item['License_Plate']}` | **{item['Confidence']}** | `{item['Timestamp']}` | {item['Frame_Number']} | {ctx_link} | {plate_link} |\\n")
+                            f.write(f"| **{item['Track_ID']}** | `{item['License_Plate']}` | **{item['Confidence']}** | {item['Avg_Sharpness']} | `{item['Timestamp']}` | {item['Frame_Number']} | {ctx_link} | {plate_link} |\\n")
                 
                 db.dump_preprocessing_csv(run_id=run_id, output_dir=OUTPUT_DIR)
                 valid_count += 1  # prevent triggering multiple times for the same count
@@ -265,20 +267,6 @@ def run() -> None:
     import json
     import subprocess
     
-    # ── Launch Streamlit GUI ──
-    gui_env = os.environ.copy()
-    gui_env["ALPR_RUN_ROOT"] = OUTPUT_DIR
-    gui_env["REFRESH_SECONDS"] = "2"
-    try:
-        gui_path = os.path.join(config.PROJECT_ROOT, "GUI", "app.py")
-        subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", gui_path],
-            env=gui_env
-        )
-        logger.info("Launched Streamlit GUI in background.")
-    except Exception as e:
-        logger.warning(f"Could not launch Streamlit GUI: {e}")
-
     logger.info("Loading models (vehicle=%s, plate=%s, device=%s)...",
                 config.VEHICLE_MODEL_PATH, config.PLATE_MODEL_PATH, config.DEVICE)
 

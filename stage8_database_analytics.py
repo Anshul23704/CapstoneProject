@@ -66,6 +66,7 @@ class DatabaseAnalyticsStage:
         stitched_track_ids     TEXT,
         low_diversity          INTEGER NOT NULL DEFAULT 0,
         possible_id_switch     INTEGER NOT NULL DEFAULT 0,
+        avg_sharpness          REAL    DEFAULT 0.0,
         created_at             DATETIME DEFAULT CURRENT_TIMESTAMP
     )
     """
@@ -104,6 +105,7 @@ class DatabaseAnalyticsStage:
         stitched_track_ids:   str   = "",
         low_diversity:        bool  = False,
         possible_id_switch:   bool  = False,
+        avg_sharpness:        float = 0.0,
     ) -> None:
         sql = """
             INSERT INTO ocr_results
@@ -111,8 +113,9 @@ class DatabaseAnalyticsStage:
                  status, is_valid, finalize_reason, plate_bbox,
                  num_readings, plate_text_bilateral, conf_bilateral,
                  winner_branch,
-                 stitched_track_ids, low_diversity, possible_id_switch)
-            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                 stitched_track_ids, low_diversity, possible_id_switch,
+                 avg_sharpness)
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """
         with self._lock:
             self._conn.execute(sql, (
@@ -123,6 +126,7 @@ class DatabaseAnalyticsStage:
                 num_readings, plate_text_bilateral, conf_bilateral,
                 winner_branch,
                 stitched_track_ids, int(low_diversity), int(possible_id_switch),
+                avg_sharpness,
             ))
             self._conn.commit()
 

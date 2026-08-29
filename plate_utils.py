@@ -279,6 +279,42 @@ def enhance_plate_crop_bilateral(
     return cv2.cvtColor(filtered, cv2.COLOR_GRAY2BGR)
 
 
+def enhance_plate_crop_adaptive(
+    plate_crop: np.ndarray,
+    upscale_factor: float = 2.0,
+    min_width: int = 120,
+    min_height: int = 30,
+) -> np.ndarray:
+    """
+    Branch B: Adaptive Thresholding Binarization.
+    Normalizes lighting unevenness (shadows, glares) by thresholding locally.
+    """
+    if plate_crop is None or plate_crop.size == 0:
+        return plate_crop
+
+    h, w = plate_crop.shape[:2]
+    scale = max(upscale_factor, min_width / max(w, 1), min_height / max(h, 1))
+    if scale > 1.0:
+        plate_crop = cv2.resize(
+            plate_crop,
+            (max(1, int(w * scale)), max(1, int(h * scale))),
+            interpolation=cv2.INTER_LANCZOS4,
+        )
+
+    gray = cv2.cvtColor(plate_crop, cv2.COLOR_BGR2GRAY)
+    
+    # Apply CLAHE to equalize local contrast
+    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8,8))
+    gray = clahe.apply(gray)
+    
+    # Adaptive thresholding
+    binary = cv2.adaptiveThreshold(
+        gray, 255, cv2.ADAPTIVE_THRESH_GAUSSIAN_C, cv2.THRESH_BINARY, 15, 5
+    )
+
+    return cv2.cvtColor(binary, cv2.COLOR_GRAY2BGR)
+
+
 
 
 

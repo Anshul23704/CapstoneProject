@@ -196,20 +196,6 @@ def run() -> None:
     with open(RAW_CSV_PATH, "w", newline="", encoding="utf-8") as f:
         csv.DictWriter(f, fieldnames=_RICH_FIELDS).writeheader()
         
-    # ── Launch Streamlit GUI ──
-    gui_env = os.environ.copy()
-    gui_env["ALPR_RUN_ROOT"] = OUTPUT_DIR
-    gui_env["REFRESH_SECONDS"] = "2"
-    try:
-        gui_path = os.path.join(config.PROJECT_ROOT, "GUI", "app.py")
-        subprocess.Popen(
-            [sys.executable, "-m", "streamlit", "run", gui_path],
-            env=gui_env
-        )
-        logger.info("Launched Streamlit GUI in background.")
-    except Exception as e:
-        logger.warning(f"Could not launch Streamlit GUI: {e}")
-
     logger.info("Loading models (vehicle=%s, plate=%s, device=%s)...",
                 config.VEHICLE_MODEL_PATH, config.PLATE_MODEL_PATH, config.DEVICE)
 

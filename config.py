@@ -87,7 +87,7 @@ AREA_STD_THRESHOLD      = 5000.0
 DIVERSITY_RATIO_LIMIT   = 0.95
 
 # ── Job creation (Stage 5) ────────────────────────────────────────────────────
-TOP_K_FRAMES    = 20
+TOP_K_FRAMES    = 15
 BLUR_THRESHOLD  = 80.0   # Laplacian variance below this = too blurry/occluded
 
 # ── Plate detection (Stage 2.5) ────────────────────────────────────────────────

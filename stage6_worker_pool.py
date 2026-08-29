@@ -45,6 +45,7 @@ from plate_utils import (
     clean_ocr_text,
     deskew_plate_crop,
     enhance_plate_crop_bilateral,
+    enhance_plate_crop_adaptive,
     laplacian_sharpness,
     license_complies_format,
     format_license,
@@ -144,6 +145,7 @@ class RecognitionResult:
     # Raw bounding boxes for Stage 10 video rendering
     raw_detections:           tuple = ()
     winner_branch:            str = "none"
+    avg_sharpness:            float = 0.0
 
 
 @dataclass
@@ -209,10 +211,12 @@ class Worker(threading.Thread):
         raw_detections: List[Tuple[BBox, Optional[BBox], int, str, float]] = []
 
         bilateral_wins = 0
+        sharpness_values = []
 
         for frame_entry in job.selected_frames:
-
-            if laplacian_sharpness(frame_entry.crop) < self.cfg.blur_threshold:
+            
+            sharpness = laplacian_sharpness(frame_entry.crop)
+            if sharpness < self.cfg.blur_threshold:
                 DIAG.bump("skipped_blurry")
                 continue
 
@@ -238,20 +242,37 @@ class Worker(threading.Thread):
             plate_bilateral = enhance_plate_crop_bilateral(
                 plate_deskewed, upscale_factor=self.cfg.upscale_factor
             )
+            plate_adaptive = enhance_plate_crop_adaptive(
+                plate_deskewed, upscale_factor=self.cfg.upscale_factor
+            )
 
             # 3. OCR Recognition
             tag_b = f"t{job.track_id}_f{frame_entry.frame_idx}_bilateral"
             text_b, conf_b = self._run_ocr_validated(plate_bilateral, tag=tag_b)
+            
+            tag_a = f"t{job.track_id}_f{frame_entry.frame_idx}_adaptive"
+            text_a, conf_a = self._run_ocr_validated(plate_adaptive, tag=tag_a)
+
+            # Pick best algorithm for this frame
+            if text_a and (not text_b or conf_a > conf_b):
+                frame_text, frame_conf = text_a, conf_a
+                winner_alg = "adaptive"
+                best_plate_img = plate_adaptive
+            elif text_b:
+                frame_text, frame_conf = text_b, conf_b
+                winner_alg = "bilateral"
+                best_plate_img = plate_bilateral
+                bilateral_wins += 1
+            else:
+                frame_text, frame_conf = "", 0.0
+                winner_alg = "none"
+                best_plate_img = plate_bilateral
 
             if text_b:
                 DIAG.bump("ocr_forwarded_bilateral")
                 readings_bilateral.append(
                     (text_b, conf_b, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
                 )
-                frame_text, frame_conf = text_b, conf_b
-                bilateral_wins += 1
-            else:
-                frame_text, frame_conf = "", 0.0
 
             # 4. Save enhanced crop and comparison context image
             if self.cfg.save_crops and self.cfg.crops_dir:
@@ -261,7 +282,7 @@ class Worker(threading.Thread):
                     
                     os.makedirs(target_dir, exist_ok=True)
                     prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
-                    cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_bilateral.png"), plate_bilateral)
+                    cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_{winner_alg}.png"), best_plate_img)
 
                     roi = frame_entry.full_frame
                     if roi is not None and roi.size > 0:
@@ -275,8 +296,8 @@ class Worker(threading.Thread):
                         cv2.rectangle(context_img, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
                         
                         # Comparison Label Overlay
-                        lbl_b = f"Bilateral: {text_b} ({conf_b:.2f})" if text_b else "Bilateral: --"
-                        cv2.putText(context_img, lbl_b, (lx1, max(18, ly1 - 18)),
+                        lbl = f"{winner_alg.title()}: {frame_text} ({frame_conf:.2f})" if frame_text else "No Plate Detected"
+                        cv2.putText(context_img, lbl, (lx1, max(18, ly1 - 18)),
                                     cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
                         cv2.imwrite(os.path.join(target_dir, f"{prefix}_context.png"), context_img)
                 except Exception as exc:
@@ -288,6 +309,7 @@ class Worker(threading.Thread):
             ))
 
             if frame_text:
+                sharpness_values.append(sharpness)
                 frame_readings.append(
                     (frame_text, frame_conf, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
                 )
@@ -297,7 +319,9 @@ class Worker(threading.Thread):
                     best_bbox = frame_entry.plate_bbox
 
         status = RecognitionStatus.SUCCESS if best_text else RecognitionStatus.NO_PLATE
-        winner = "bilateral"
+        winner = "adaptive" if bilateral_wins < (len(frame_readings) / 2.0) else "bilateral"
+        
+        avg_sharpness = float(sum(sharpness_values) / len(sharpness_values)) if sharpness_values else 0.0
 
         return RecognitionResult(
             job_id                   = job.job_id,
@@ -310,6 +334,7 @@ class Worker(threading.Thread):
             frame_readings_bilateral = tuple(readings_bilateral),
             raw_detections           = tuple(raw_detections),
             winner_branch            = winner,
+            avg_sharpness            = avg_sharpness,
         )
 
     # ── Cropping (no detection — plate_bbox is already known) ─────────────────

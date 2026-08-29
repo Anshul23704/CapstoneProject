@@ -696,12 +696,17 @@ elif page == "Vehicles":
             db_t["confidence"].iloc[0] if not db_t.empty and "confidence" in db_t else np.nan
         )
 
-        c = st.columns(5)
-        with c[0]: metric_card("Track", str(selected), "cross-artifact identifier")
-        with c[1]: metric_card("Raw observations", fmt_num(len(raw_t)))
-        with c[2]: metric_card("Rich observations", fmt_num(len(rich_t)))
+        sharpness = final_t["Avg_Sharpness"].iloc[0] if not final_t.empty and "Avg_Sharpness" in final_t else (
+            db_t["avg_sharpness"].iloc[0] if not db_t.empty and "avg_sharpness" in db_t else np.nan
+        )
+
+        c = st.columns(6)
+        with c[0]: metric_card("Track", str(selected), "identifier")
+        with c[1]: metric_card("Raw obs", fmt_num(len(raw_t)))
+        with c[2]: metric_card("Rich obs", fmt_num(len(rich_t)))
         with c[3]: metric_card("OCR jobs", fmt_num(len(db_t)))
-        with c[4]: metric_card("Plate / confidence", f"{plate}", f"{float(conf):.4f}" if pd.notna(conf) else "—")
+        with c[4]: metric_card("Plate / conf", f"{plate}", f"{float(conf):.4f}" if pd.notna(conf) else "—")
+        with c[5]: metric_card("Avg Sharpness", f"{float(sharpness):.2f}" if pd.notna(sharpness) else "—")
 
         if not raw_t.empty:
             first, last = raw_t["frame_nmr"].min(), raw_t["frame_nmr"].max()
