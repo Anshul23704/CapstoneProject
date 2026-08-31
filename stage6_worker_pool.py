@@ -123,9 +123,10 @@ def _debug_save(category: str, img: np.ndarray, tag: str = "") -> None:
 
 
 class RecognitionStatus(Enum):
-    SUCCESS  = auto()
-    FAILED   = auto()
-    NO_PLATE = auto()
+    SUCCESS        = auto()
+    PARTIAL_SUCCESS= auto()
+    FAILED         = auto()
+    NO_PLATE       = auto()
 
 
 @dataclass
@@ -140,6 +141,9 @@ class RecognitionResult:
     # Per-frame OCR readings forwarded to Stage 7 temporal fusion:
     # tuple of (formatted_text, conf, vehicle_bbox, plate_bbox_full, frame_idx)
     frame_readings:           tuple = ()
+    # Partial OCR readings used as a fallback if no full frames are valid:
+    # tuple of (text, conf, rel_x_min, rel_x_max, frame_idx)
+    frame_partials:           tuple = ()
     # Specific per-branch readings for side-by-side comparison:
     frame_readings_bilateral: tuple = ()
     # Raw bounding boxes for Stage 10 video rendering
@@ -157,6 +161,7 @@ class WorkerConfig:
     save_crops:       bool  = True
     crops_dir:        Optional[str] = None
     high_conf_crops_dir: Optional[str] = None
+    partial_crops_dir: Optional[str] = None
     high_conf_threshold: float = 0.40
 
 
@@ -207,6 +212,7 @@ class Worker(threading.Thread):
         best_conf  = 0.0
         best_bbox: Optional[BBox] = None
         frame_readings: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
+        frame_partials: List[Tuple[str, float, float, float, int]] = []
         readings_bilateral: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
         raw_detections: List[Tuple[BBox, Optional[BBox], int, str, float]] = []
 
@@ -248,25 +254,50 @@ class Worker(threading.Thread):
 
             # 3. OCR Recognition
             tag_b = f"t{job.track_id}_f{frame_entry.frame_idx}_bilateral"
-            text_b, conf_b = self._run_ocr_validated(plate_bilateral, tag=tag_b)
+            text_b, conf_b, partials_b = self._run_ocr_validated(plate_bilateral, tag=tag_b)
             
             tag_a = f"t{job.track_id}_f{frame_entry.frame_idx}_adaptive"
-            text_a, conf_a = self._run_ocr_validated(plate_adaptive, tag=tag_a)
+            text_a, conf_a, partials_a = self._run_ocr_validated(plate_adaptive, tag=tag_a)
 
             # Pick best algorithm for this frame
             if text_a and (not text_b or conf_a > conf_b):
                 frame_text, frame_conf = text_a, conf_a
+                frame_partials_current = partials_a
                 winner_alg = "adaptive"
                 best_plate_img = plate_adaptive
             elif text_b:
                 frame_text, frame_conf = text_b, conf_b
+                frame_partials_current = partials_b
                 winner_alg = "bilateral"
                 best_plate_img = plate_bilateral
                 bilateral_wins += 1
             else:
                 frame_text, frame_conf = "", 0.0
                 winner_alg = "none"
-                best_plate_img = plate_bilateral
+                # If neither had a full plate, still grab partials if available
+                if partials_a and not partials_b:
+                    frame_partials_current = partials_a
+                    best_plate_img = plate_adaptive
+                    winner_alg = "adaptive_partial"
+                elif partials_b and not partials_a:
+                    frame_partials_current = partials_b
+                    best_plate_img = plate_bilateral
+                    winner_alg = "bilateral_partial"
+                elif partials_a and partials_b:
+                    # Pick the branch with higher average partial confidence
+                    conf_a_avg = sum(c for _, c, _, _ in partials_a) / len(partials_a)
+                    conf_b_avg = sum(c for _, c, _, _ in partials_b) / len(partials_b)
+                    if conf_a_avg > conf_b_avg:
+                        frame_partials_current = partials_a
+                        best_plate_img = plate_adaptive
+                        winner_alg = "adaptive_partial"
+                    else:
+                        frame_partials_current = partials_b
+                        best_plate_img = plate_bilateral
+                        winner_alg = "bilateral_partial"
+                else:
+                    frame_partials_current = []
+                    best_plate_img = plate_bilateral
 
             if text_b:
                 DIAG.bump("ocr_forwarded_bilateral")
@@ -275,14 +306,20 @@ class Worker(threading.Thread):
                 )
 
             # 4. Save enhanced crop and comparison context image
-            if self.cfg.save_crops and self.cfg.crops_dir:
+            if self.cfg.save_crops and (self.cfg.crops_dir or self.cfg.partial_crops_dir):
                 try:
-                    # Decide which directory to use based on confidence
-                    target_dir = self.cfg.high_conf_crops_dir if (self.cfg.high_conf_crops_dir and conf_b >= self.cfg.high_conf_threshold) else self.cfg.crops_dir
+                    # Decide which directory to use
+                    if frame_text:
+                        target_dir = self.cfg.high_conf_crops_dir if (self.cfg.high_conf_crops_dir and frame_conf >= self.cfg.high_conf_threshold) else self.cfg.crops_dir
+                    elif frame_partials_current:
+                        target_dir = self.cfg.partial_crops_dir
+                    else:
+                        target_dir = None
                     
-                    os.makedirs(target_dir, exist_ok=True)
-                    prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
-                    cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_{winner_alg}.png"), best_plate_img)
+                    if target_dir:
+                        os.makedirs(target_dir, exist_ok=True)
+                        prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
+                        cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_{winner_alg}.png"), best_plate_img)
 
                     roi = frame_entry.full_frame
                     if roi is not None and roi.size > 0:
@@ -317,8 +354,18 @@ class Worker(threading.Thread):
                     best_conf = frame_conf
                     best_text = frame_text
                     best_bbox = frame_entry.plate_bbox
+            elif frame_partials_current:
+                sharpness_values.append(sharpness)
+                for (p_txt, p_conf, rxmin, rxmax) in frame_partials_current:
+                    frame_partials.append((p_txt, p_conf, rxmin, rxmax, frame_entry.frame_idx))
 
-        status = RecognitionStatus.SUCCESS if best_text else RecognitionStatus.NO_PLATE
+        if best_text:
+            status = RecognitionStatus.SUCCESS
+        elif frame_partials:
+            status = RecognitionStatus.PARTIAL_SUCCESS
+        else:
+            status = RecognitionStatus.NO_PLATE
+            
         winner = "adaptive" if bilateral_wins < (len(frame_readings) / 2.0) else "bilateral"
         
         avg_sharpness = float(sum(sharpness_values) / len(sharpness_values)) if sharpness_values else 0.0
@@ -331,6 +378,7 @@ class Worker(threading.Thread):
             status                   = status,
             plate_bbox               = best_bbox,
             frame_readings           = tuple(frame_readings),
+            frame_partials           = tuple(frame_partials),
             frame_readings_bilateral = tuple(readings_bilateral),
             raw_detections           = tuple(raw_detections),
             winner_branch            = winner,
@@ -367,8 +415,9 @@ class Worker(threading.Thread):
 
     _MIN_PLATE_LEN = 8
     _MAX_PLATE_LEN = 10
+    _MIN_PARTIAL_LEN = 3
 
-    def _run_ocr_validated(self, plate_img: np.ndarray, tag: str = "") -> Tuple[str, float]:
+    def _run_ocr_validated(self, plate_img: np.ndarray, tag: str = "") -> Tuple[str, float, List[Tuple[str, float, float, float]]]:
         """
         Iterates EasyOCR detections and supports:
         1. Single-line plate candidate extraction and correction.
@@ -376,6 +425,8 @@ class Worker(threading.Thread):
         3. Dual-pass region split OCR (Left: State+Series, Right: 4-digit registration number).
         4. Automatic stripping of accidental 'IND' country identifier holograms.
         5. Soft positional heuristic formatting for Indian vehicle layout.
+        Returns:
+            best_text, best_conf, list of (text, conf, rel_x_min, rel_x_max)
         """
         detections = self.ocr.readtext(
             plate_img,
@@ -389,7 +440,10 @@ class Worker(threading.Thread):
         )
 
         plausible: List[Tuple[str, float]] = []
+        partials: List[Tuple[str, float, float, float]] = []
         raw_seen: List[str] = []
+
+        img_w = max(1, plate_img.shape[1])
 
         if detections:
             # 1. Single detection candidates
@@ -406,6 +460,12 @@ class Worker(threading.Thread):
 
                 if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
                     plausible.append((corrected, float(conf)))
+                elif self._MIN_PARTIAL_LEN <= len(corrected) < self._MIN_PLATE_LEN:
+                    # Calculate relative x position within the plate crop
+                    xs = [p[0] for p in _bbox]
+                    rxmin = max(0.0, min(xs) / img_w)
+                    rxmax = min(1.0, max(xs) / img_w)
+                    partials.append((corrected, float(conf), rxmin, rxmax))
 
             # 2. Multi-line / vertically stacked detection merging (for 2-line plates)
             if len(detections) >= 2:
@@ -477,7 +537,7 @@ class Worker(threading.Thread):
                 "OCR forwarded (soft-corrected): '%s' conf=%.3f",
                 best_text, best_conf,
             )
-            return best_text, best_conf
+            return best_text, best_conf, partials
 
         if raw_seen:
             DIAG.bump("ocr_format_rejected")
@@ -486,7 +546,7 @@ class Worker(threading.Thread):
         else:
             DIAG.bump("ocr_empty")
             _debug_save("ocr_empty", plate_img, tag=tag)
-        return "", 0.0
+        return "", 0.0, partials
 
 
 class WorkerPoolStage:

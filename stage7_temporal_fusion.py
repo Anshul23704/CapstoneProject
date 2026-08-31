@@ -114,3 +114,62 @@ class TemporalFusionStage:
             len(aligned), len(valid), target_length, fused_text, avg_conf, is_valid,
         )
         return fused_text, float(avg_conf), is_valid
+
+    def process_partials(self, partials: List[Tuple[str, float, float, float, int]]) -> Tuple[str, float, bool]:
+        """
+        Spatial alignment fallback for partial plate readings.
+        """
+        if not partials:
+            return "", 0.0, False
+
+        # Assuming a standard 10-character plate for binning
+        num_bins = 10
+        bins = [{} for _ in range(num_bins)]
+
+        total_conf = 0.0
+        valid_partials_count = 0
+        
+        for (text, conf, rxmin, rxmax, _) in partials:
+            text = text.upper().replace(" ", "").replace("-", "")
+            if not text:
+                continue
+                
+            total_conf += conf
+            valid_partials_count += 1
+            length = len(text)
+            char_width = (rxmax - rxmin) / length if length > 0 else 0
+            
+            for i, ch in enumerate(text):
+                char_center = rxmin + (i + 0.5) * char_width
+                bin_idx = int(char_center * num_bins)
+                bin_idx = max(0, min(num_bins - 1, bin_idx))
+                
+                # Apply same positional priors as full fusion if we assume 10 slots
+                is_alpha_slot = bin_idx in (0, 1, 4, 5)
+                is_digit_slot = bin_idx in (2, 3, 6, 7, 8, 9)
+                
+                if is_alpha_slot:
+                    ch = INT_TO_CHAR.get(ch, ch)
+                elif is_digit_slot:
+                    ch = CHAR_TO_INT.get(ch, ch)
+                
+                bins[bin_idx][ch] = bins[bin_idx].get(ch, 0.0) + conf
+
+        fused_chars = []
+        for i in range(num_bins):
+            if bins[i]:
+                winner = max(bins[i], key=bins[i].__getitem__)
+                fused_chars.append(winner)
+
+        raw_fused = "".join(fused_chars)
+        fused_text = soft_format_indian_plate(raw_fused)
+        avg_conf = total_conf / valid_partials_count if valid_partials_count > 0 else 0.0
+        
+        # Consider valid only if we stitched together at least a plausible length
+        is_valid = len(fused_text) >= 8
+        
+        logger.debug(
+            "TemporalFusion(Partials): %d partials stitched -> '%s' conf=%.3f valid=%s",
+            len(partials), fused_text, avg_conf, is_valid,
+        )
+        return fused_text, float(avg_conf), is_valid

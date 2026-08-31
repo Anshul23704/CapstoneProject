@@ -44,7 +44,7 @@ PLATE_MODEL_PATH = os.getenv(
 
 VIDEO_SOURCE = os.getenv(
     "VIDEO_SOURCE",
-    os.path.join(PROJECT_ROOT, "dataset", "test2.mp4")
+    os.path.join(PROJECT_ROOT, "dataset", "test3.mp4")
 )
 
 OUTPUT_ROOT = os.getenv(

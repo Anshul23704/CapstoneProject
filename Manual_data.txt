@@ -1,0 +1,23 @@
+test1.mp4: 
+KA01NF0626 (Cannot visually differentiate whether N/M/H)
+KA054161 (not a car)
+KA53MP3279 
+KA01AP6603 (Visible for very short time)
+KA05AL1763 (Side at high angle, visible for a short time)
+
+test3.mp4
+KA01AQ0320 
+KA01NF0626
+KA03NA3721 (Highly stylized plate, difficult for human to differentiate ka or ha)
+KA95AL3013
+KA04AC3110
+KA05AH4237
+KA53MG3247(NOT SURE ABOUT MH - COULD BE MM OR HH)
+KA03ML8437 (ANGLE, HIGH SPEED)
+KA05ME5709 (M COULD BE H OR N) 
+KA03AN3892 
+KA29C7536 
+KA53AB2519 
+KA05AL2116
+KA03AK5244
+KA53AB1807 (FAR TO THE SIDE, SHARP ANGLE, SHORT TIME)

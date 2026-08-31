@@ -191,6 +191,27 @@ def _result_consumer(
                                 "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
                                 "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
                             }
+            elif result.status == RecognitionStatus.PARTIAL_SUCCESS and result.frame_partials:
+                fused_text, fused_conf, is_valid = fusion.process_partials(result.frame_partials)
+                
+                db.insert_result(
+                    run_id=run_id,
+                    track_id=result.track_id,
+                    job_id=result.job_id,
+                    plate_text=fused_text,
+                    confidence=fused_conf,
+                    status=result.status.name,
+                    is_valid=is_valid,
+                    num_readings=len(result.frame_partials),
+                    winner_branch="spatial_fallback",
+                    avg_sharpness=result.avg_sharpness,
+                )
+                
+                if is_valid and fused_text:
+                    stats["fused_success"] += 1
+                    valid_count += 1
+                else:
+                    stats["no_plate"] += 1
             else:
                 db.insert_result(
                     run_id=run_id,
@@ -282,8 +303,10 @@ def run() -> None:
     job_creator = JobCreationStage(processing_queue, JobCreationConfig())
     crops_dir   = os.path.join(OUTPUT_DIR, "plate_crops")
     high_conf_crops_dir = os.path.join(OUTPUT_DIR, "plate_crops_high_confidence")
+    partial_crops_dir = os.path.join(OUTPUT_DIR, "partial_outputs")
     os.makedirs(crops_dir, exist_ok=True)
     os.makedirs(high_conf_crops_dir, exist_ok=True)
+    os.makedirs(partial_crops_dir, exist_ok=True)
     worker_pool = WorkerPoolStage(
         processing_queue, result_queue,
         num_workers=config.NUM_WORKERS,
@@ -291,7 +314,8 @@ def run() -> None:
             save_crops=True, 
             crops_dir=crops_dir,
             high_conf_crops_dir=high_conf_crops_dir,
-            high_conf_threshold=config.HIGH_CONF_CROP_THRESHOLD
+            high_conf_threshold=config.HIGH_CONF_CROP_THRESHOLD,
+            partial_crops_dir=partial_crops_dir
         ),
     )
     fusion = TemporalFusionStage(FusionConfig())
@@ -508,15 +532,15 @@ def run() -> None:
         logger.exception("Stage 9 (interpolation) failed")
 
     # ── Stage 10: annotated video ────────────────────────────────────────────
-    if raw_rows:
-        try:
-            out = render_annotated_video(RAW_CSV_PATH, config.VIDEO_SOURCE, ANNOTATED_VIDEO)
-            if out:
-                logger.info("Annotated video -> %s", out)
-        except Exception:
-            logger.exception("Stage 10 (visualization) failed")
-    else:
-        logger.warning("No raw detections at all — skipping Stage 10 video render")
+    # if raw_rows:
+    #     try:
+    #         out = render_annotated_video(RAW_CSV_PATH, config.VIDEO_SOURCE, ANNOTATED_VIDEO)
+    #         if out:
+    #             logger.info("Annotated video -> %s", out)
+    #     except Exception:
+    #         logger.exception("Stage 10 (visualization) failed")
+    # else:
+    #     logger.warning("No raw detections at all — skipping Stage 10 video render")
 
     unique_plates = {row["license_number"] for row in rows}
     print("\n" + "=" * 60)
