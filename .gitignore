@@ -25,7 +25,11 @@ __pycache__/
 .DS_Store
 .vscode/
 tempCodeRunnerFile.py
+# Large archives
+*.zip
+
 # Markdown files
 *.md
 !OCR_Model_Training_Context.md
 !README.md
+!CustomOCRDetails.md
