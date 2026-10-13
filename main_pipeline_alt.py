@@ -126,8 +126,6 @@ def _result_consumer(
                     num_readings=len(result.frame_readings),
                     plate_text_bilateral=fused_b,
                     conf_bilateral=conf_b,
-                    plate_text_adaptive=fused_a,
-                    conf_adaptive=conf_a,
                     winner_branch=result.winner_branch,
                 )
 
@@ -387,14 +385,17 @@ def run() -> None:
                 target_dir = high_conf_crops_dir if conf_val >= config.HIGH_CONF_CROP_THRESHOLD else crops_dir
                 
                 context_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
-                plate_b_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
-                plate_a_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
+                plate_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate.png")
+                if not os.path.exists(plate_f):
+                    plate_f = os.path.join(target_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
                 
                 # If they don't exist in high_conf_crops_dir for some reason, fallback to crops_dir
                 if not os.path.exists(context_f):
                     context_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_context.png")
-                    plate_b_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
-                    plate_a_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_adaptive.png")
+                if not os.path.exists(plate_f):
+                    plate_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate.png")
+                if not os.path.exists(plate_f):
+                    plate_f = os.path.join(crops_dir, f"track_{int(car_id):03d}_frame_{f_idx:04d}_plate_bilateral.png")
                 
                 high_conf_outputs.append({
                     "Track_ID":                  int(car_id),
@@ -403,8 +404,9 @@ def run() -> None:
                     "Timestamp":                 ts,
                     "Frame_Number":              f_idx,
                     "Context_Image_Path":        os.path.abspath(context_f) if os.path.exists(context_f) else context_f,
-                    "Plate_Bilateral_Path":      os.path.abspath(plate_b_f) if os.path.exists(plate_b_f) else plate_b_f,
-                    "Plate_Adaptive_Path":       os.path.abspath(plate_a_f) if os.path.exists(plate_a_f) else plate_a_f,
+                    "Plate_Crop_Path":           os.path.abspath(plate_f) if os.path.exists(plate_f) else plate_f,
+                    "Plate_Bilateral_Path":      os.path.abspath(plate_f) if os.path.exists(plate_f) else plate_f,
+                    "Plate_Adaptive_Path":       os.path.abspath(plate_f) if os.path.exists(plate_f) else plate_f,
                 })
 
     high_conf_outputs.sort(key=lambda x: (x["Frame_Number"], x["Track_ID"]))

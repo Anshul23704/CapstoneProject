@@ -52,6 +52,13 @@ OUTPUT_ROOT = os.getenv(
     os.path.join(PROJECT_ROOT, "output")
 )
 
+TROCR_MODEL_PATH = os.getenv(
+    "TROCR_MODEL_PATH",
+    os.path.join(PROJECT_ROOT, "model_checkpoint")
+    if os.path.exists(os.path.join(PROJECT_ROOT, "model_checkpoint"))
+    else os.path.join(PROJECT_ROOT, "trocr_integration_package", "model_checkpoint")
+)
+
 # ── Vehicle classes (COCO ids) ────────────────────────────────────────────────
 # ==============================================================================
 # REMINDER: Currently configured to track CARS ONLY (COCO class 2).
@@ -137,9 +144,9 @@ PLATE_VEHICLE_IOA_THRESHOLD = 0.35
 VEHICLE_BBOX_ASSOC_EXPAND = 0.12
 
 # ── Worker pool / OCR (Stage 6) ────────────────────────────────────────────────
-# Workers now only run OCR (plate detection moved to Stage 2.5 above), so
-# NUM_WORKERS is sized for OCR throughput, not shared with plate-model load.
-NUM_WORKERS = 3     # matches "Worker Thread 1/2/3" in the architecture diagram
+# TrOCR model runs batched inference per vehicle track.
+NUM_WORKERS = 3     # concurrent worker threads for crop preparation and dispatch
+TROCR_MIN_CONF_THRESHOLD = 0.35  # Minimum confidence to accept a raw TrOCR candidate
 
 # ── Temporal fusion (Stage 7) ─────────────────────────────────────────────────
 MIN_READINGS_FOR_FUSION = 2

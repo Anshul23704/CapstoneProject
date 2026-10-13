@@ -1,29 +1,9 @@
 """
-stage6_worker_pool.py — Worker Pool (OCR only).
+stage6_worker_pool.py — Worker Pool (TrOCR).
 
-ARCHITECTURE CHANGE vs previous version
-─────────────────────────────────────────
-Plate detection no longer happens here. It used to run per-worker, per
-selected frame, on a small padded per-vehicle ROI — meaning up to
-TOP_K_FRAMES separate detector calls per vehicle, each at a different
-effective resolution, AND every worker thread loading its own full copy of
-the plate-detector model. Two rounds of tuning that in isolation (imgsz,
-IoA slack) both backfired, because the fundamental problem wasn't the
-threshold — it was that the detector was seeing small, inconsistent,
-context-free crops instead of full frames.
-
-Plate detection now runs exactly once per frame, full-frame, in
-plate_detection.py (Stage 2.5), and Stage 3 already matched each vehicle's
-frames to a plate_bbox (full-frame coordinates) via IoA at buffering time.
-By the time a job reaches this stage, every selected frame either already
-has a known plate_bbox or it doesn't — this stage's only job is: crop it,
-enhance it, OCR it. No detector model is loaded here anymore.
-
-This stage also now forwards a raw per-frame detection record for EVERY
-frame with a matched plate_bbox — regardless of whether OCR produced valid
-text — via RecognitionResult.raw_detections. main_pipeline.py uses this to
-give Stage 10 a box to draw on every frame with a real detection, not only
-frames whose OCR happened to fully validate.
+Integrated custom fine-tuned TrOCR license plate recognition engine.
+Deprecates legacy CPU-heavy EasyOCR bilateral & adaptive contrast filters.
+Directly ingests raw BGR crops in track-level batches for fast inference.
 """
 
 from __future__ import annotations
@@ -37,18 +17,13 @@ from queue import Queue
 from typing import List, Optional, Tuple
 
 import cv2
-import easyocr
 import numpy as np
 
 import config
+from ocr_engine.trocr_engine import TrOCRInferenceEngine
 from plate_utils import (
     clean_ocr_text,
-    deskew_plate_crop,
-    enhance_plate_crop_bilateral,
-    enhance_plate_crop_adaptive,
     laplacian_sharpness,
-    license_complies_format,
-    format_license,
     soft_format_indian_plate,
     plate_edge_density,
 )
@@ -59,21 +34,16 @@ BBox = Tuple[int, int, int, int]
 
 
 class _DiagnosticCounters:
-    """
-    DIAGNOSTIC (temporary): tallies, across all worker threads, how many
-    frames survive each step of the OCR pipeline. Printed once by
-    WorkerPoolStage.shutdown().
-    """
+    """Tallies, across all worker threads, how many frames survive each step."""
     def __init__(self) -> None:
         self._lock = threading.Lock()
-        self.frames_seen        = 0
-        self.skipped_blurry     = 0
-        self.no_plate_bbox      = 0   # frame selected but Stage 3 never matched a plate to it
-        self.crop_empty         = 0   # matched plate_bbox produced an empty/invalid crop
-        self.ocr_empty          = 0   # frames where EasyOCR returned zero detections
-        self.ocr_format_rejected = 0  # every OCR detection too short/long to plausibly be a plate
-        self.ocr_forwarded_plausible = 0  # forwarded to fusion without being independently valid
-        self.ocr_forwarded_bilateral = 0
+        self.frames_seen         = 0
+        self.skipped_blurry      = 0
+        self.no_plate_bbox       = 0
+        self.crop_empty          = 0
+        self.ocr_empty           = 0
+        self.ocr_format_rejected = 0
+        self.ocr_forwarded       = 0
 
     def bump(self, field: str) -> None:
         with self._lock:
@@ -82,51 +52,27 @@ class _DiagnosticCounters:
     def report(self) -> str:
         return (
             "\n" + "=" * 60 +
-            "\n  PLATE PIPELINE DIAGNOSTIC & BRANCH COMPARISON\n" +
+            "\n  TrOCR PIPELINE DIAGNOSTIC REPORT\n" +
             "=" * 60 +
             f"\n  Frames attempted (selected) : {self.frames_seen}"
             f"\n  Skipped (too blurry)        : {self.skipped_blurry}"
             f"\n  No plate_bbox from Stage 3  : {self.no_plate_bbox}"
             f"\n  Empty/invalid crop          : {self.crop_empty}"
             f"\n  OCR returned 0 detections   : {self.ocr_empty}"
-            f"\n  OCR too short/long (noise)  : {self.ocr_format_rejected}"
-            f"\n  OCR forwarded to fusion     : {self.ocr_forwarded_plausible}"
-            f"\n    └─ Bilateral branch reads : {self.ocr_forwarded_bilateral}"
+            f"\n  OCR too short/low conf      : {self.ocr_format_rejected}"
+            f"\n  OCR forwarded to fusion     : {self.ocr_forwarded}"
             "\n" + "=" * 60
         )
 
 
 DIAG = _DiagnosticCounters()
 
-# DIAGNOSTIC (temporary): saves a capped sample of the actual crops fed to
-# EasyOCR at each failure point, plus the raw text EasyOCR returned.
-import os as _os
-_DEBUG_DIR = _os.path.join(_os.getcwd(), "debug_plate_crops")
-_DEBUG_MAX_PER_CATEGORY = 25
-_DEBUG_LOCK = threading.Lock()
-_DEBUG_COUNTS: dict = {}
-
-
-def _debug_save(category: str, img: np.ndarray, tag: str = "") -> None:
-    with _DEBUG_LOCK:
-        if _DEBUG_COUNTS.get(category, 0) >= _DEBUG_MAX_PER_CATEGORY:
-            return
-        _DEBUG_COUNTS[category] = _DEBUG_COUNTS.get(category, 0) + 1
-        n = _DEBUG_COUNTS[category]
-    try:
-        cat_dir = _os.path.join(_DEBUG_DIR, category)
-        _os.makedirs(cat_dir, exist_ok=True)
-        fname = f"{n:03d}{('_' + tag) if tag else ''}.png"
-        cv2.imwrite(_os.path.join(cat_dir, fname), img)
-    except Exception:
-        logger.exception("debug_save failed for category=%s", category)
-
 
 class RecognitionStatus(Enum):
-    SUCCESS        = auto()
-    PARTIAL_SUCCESS= auto()
-    FAILED         = auto()
-    NO_PLATE       = auto()
+    SUCCESS         = auto()
+    PARTIAL_SUCCESS = auto()
+    FAILED          = auto()
+    NO_PLATE        = auto()
 
 
 @dataclass
@@ -141,40 +87,44 @@ class RecognitionResult:
     # Per-frame OCR readings forwarded to Stage 7 temporal fusion:
     # tuple of (formatted_text, conf, vehicle_bbox, plate_bbox_full, frame_idx)
     frame_readings:           tuple = ()
-    # Partial OCR readings used as a fallback if no full frames are valid:
-    # tuple of (text, conf, rel_x_min, rel_x_max, frame_idx)
     frame_partials:           tuple = ()
-    # Specific per-branch readings for side-by-side comparison:
     frame_readings_bilateral: tuple = ()
     # Raw bounding boxes for Stage 10 video rendering
     raw_detections:           tuple = ()
-    winner_branch:            str = "none"
+    winner_branch:            str = "trocr"
     avg_sharpness:            float = 0.0
 
 
 @dataclass
 class WorkerConfig:
-    plate_padding:    int   = config.PLATE_PADDING
-    use_gpu:          bool  = (config.DEVICE == "cuda")
-    upscale_factor:   float = config.PLATE_UPSCALE_FACTOR
-    blur_threshold:   float = config.BLUR_THRESHOLD
-    save_crops:       bool  = True
-    crops_dir:        Optional[str] = None
+    plate_padding:       int   = config.PLATE_PADDING
+    use_gpu:             bool  = (config.DEVICE in ("cuda", "mps"))
+    upscale_factor:      float = config.PLATE_UPSCALE_FACTOR
+    blur_threshold:      float = config.BLUR_THRESHOLD
+    save_crops:          bool  = True
+    crops_dir:           Optional[str] = None
     high_conf_crops_dir: Optional[str] = None
-    partial_crops_dir: Optional[str] = None
-    high_conf_threshold: float = 0.40
+    partial_crops_dir:   Optional[str] = None
+    high_conf_threshold: float = config.HIGH_CONF_CROP_THRESHOLD
+    trocr_model_path:    str   = config.TROCR_MODEL_PATH
+    min_conf:            float = config.TROCR_MIN_CONF_THRESHOLD
 
 
 class Worker(threading.Thread):
 
-    def __init__(self, job_q: Queue, result_q: Queue, config: WorkerConfig):
+    def __init__(self, job_q: Queue, result_q: Queue, config: WorkerConfig = None, config_obj: WorkerConfig = None):
         super().__init__(daemon=True)
         self.job_q    = job_q
         self.result_q = result_q
-        self.cfg      = config
+        self.cfg      = config or config_obj or WorkerConfig()
 
-        logger.info("Worker init: loading EasyOCR (gpu=%s)", config.use_gpu)
-        self.ocr = easyocr.Reader(['en'], gpu=config.use_gpu, verbose=False)
+        logger.info("Worker init: loading TrOCR engine (model=%s, device=%s)",
+                    self.cfg.trocr_model_path, config.DEVICE if hasattr(config, "DEVICE") else "auto")
+        self.engine = TrOCRInferenceEngine(
+            model_path=self.cfg.trocr_model_path,
+            device=config.DEVICE,
+            use_fp16=True,
+        )
 
     def run(self) -> None:
         while True:
@@ -199,28 +149,19 @@ class Worker(threading.Thread):
 
     def _process(self, job) -> RecognitionResult:
         """
-        For each selected frame:
-          1. Skip if vehicle crop is too blurry.
-          2. Use plate_bbox already matched in Stage 3.
-          3. Crop plate and apply geometric perspective deskewing.
-          4. Parallely execute Branch A (Bilateral) and Branch B (Adaptive Contrast).
-          5. Save both enhanced crops (_plate_bilateral.png & _plate_adaptive.png)
-             and the context image with comparison overlay.
-          6. Run OCR on both and record comparative performance.
+        Runs track-level batched TrOCR inference across selected frames.
+        1. Filters out frames that are too blurry or have invalid crops.
+        2. Crops the plate with standard padding.
+        3. Batches all crops for the vehicle track in a single forward pass.
+        4. Validates and syntactically formats predicted plate strings.
+        5. Saves crops and context images.
         """
-        best_text  = ""
-        best_conf  = 0.0
-        best_bbox: Optional[BBox] = None
-        frame_readings: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
-        frame_partials: List[Tuple[str, float, float, float, int]] = []
-        readings_bilateral: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
+        valid_candidates = []  # tuples of (frame_entry, plate_crop, sharpness)
         raw_detections: List[Tuple[BBox, Optional[BBox], int, str, float]] = []
-
-        bilateral_wins = 0
+        frame_readings: List[Tuple[str, float, BBox, Optional[BBox], int]] = []
         sharpness_values = []
 
         for frame_entry in job.selected_frames:
-            
             sharpness = laplacian_sharpness(frame_entry.crop)
             if sharpness < self.cfg.blur_threshold:
                 DIAG.bump("skipped_blurry")
@@ -241,133 +182,81 @@ class Worker(threading.Thread):
                 DIAG.bump("crop_empty")
                 continue
 
-            # 1. Perspective Deskewing
-            plate_deskewed = deskew_plate_crop(plate_crop)
+            valid_candidates.append((frame_entry, plate_crop, sharpness))
 
-            # 2. Preprocessing
-            plate_bilateral = enhance_plate_crop_bilateral(
-                plate_deskewed, upscale_factor=self.cfg.upscale_factor
-            )
-            plate_adaptive = enhance_plate_crop_adaptive(
-                plate_deskewed, upscale_factor=self.cfg.upscale_factor
-            )
+        if valid_candidates:
+            # Batched TrOCR GPU inference across all crops for this track
+            crops_batch = [c for (_, c, _) in valid_candidates]
+            batch_predictions = self.engine.predict_batch(crops_batch)
 
-            # 3. OCR Recognition
-            tag_b = f"t{job.track_id}_f{frame_entry.frame_idx}_bilateral"
-            text_b, conf_b, partials_b = self._run_ocr_validated(plate_bilateral, tag=tag_b)
-            
-            tag_a = f"t{job.track_id}_f{frame_entry.frame_idx}_adaptive"
-            text_a, conf_a, partials_a = self._run_ocr_validated(plate_adaptive, tag=tag_a)
+            for (frame_entry, plate_crop, sharpness), (pred_text, avg_conf, char_confs) in zip(valid_candidates, batch_predictions):
+                clean = clean_ocr_text(pred_text)
+                if clean.startswith("IND") and len(clean) > 10:
+                    clean = clean[3:]
 
-            # Pick best algorithm for this frame
-            if text_a and (not text_b or conf_a > conf_b):
-                frame_text, frame_conf = text_a, conf_a
-                frame_partials_current = partials_a
-                winner_alg = "adaptive"
-                best_plate_img = plate_adaptive
-            elif text_b:
-                frame_text, frame_conf = text_b, conf_b
-                frame_partials_current = partials_b
-                winner_alg = "bilateral"
-                best_plate_img = plate_bilateral
-                bilateral_wins += 1
-            else:
-                frame_text, frame_conf = "", 0.0
-                winner_alg = "none"
-                # If neither had a full plate, still grab partials if available
-                if partials_a and not partials_b:
-                    frame_partials_current = partials_a
-                    best_plate_img = plate_adaptive
-                    winner_alg = "adaptive_partial"
-                elif partials_b and not partials_a:
-                    frame_partials_current = partials_b
-                    best_plate_img = plate_bilateral
-                    winner_alg = "bilateral_partial"
-                elif partials_a and partials_b:
-                    # Pick the branch with higher average partial confidence
-                    conf_a_avg = sum(c for _, c, _, _ in partials_a) / len(partials_a)
-                    conf_b_avg = sum(c for _, c, _, _ in partials_b) / len(partials_b)
-                    if conf_a_avg > conf_b_avg:
-                        frame_partials_current = partials_a
-                        best_plate_img = plate_adaptive
-                        winner_alg = "adaptive_partial"
-                    else:
-                        frame_partials_current = partials_b
-                        best_plate_img = plate_bilateral
-                        winner_alg = "bilateral_partial"
+                formatted = soft_format_indian_plate(clean)
+
+                # Plausibility gate: standard plate length >= 6 and confidence threshold
+                if len(formatted) >= 6 and avg_conf >= self.cfg.min_conf:
+                    DIAG.bump("ocr_forwarded")
+                    sharpness_values.append(sharpness)
+                    frame_readings.append(
+                        (formatted, avg_conf, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
+                    )
+                    f_text, f_conf = formatted, avg_conf
                 else:
-                    frame_partials_current = []
-                    best_plate_img = plate_bilateral
-
-            if text_b:
-                DIAG.bump("ocr_forwarded_bilateral")
-                readings_bilateral.append(
-                    (text_b, conf_b, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
-                )
-
-            # 4. Save enhanced crop and comparison context image
-            if self.cfg.save_crops and (self.cfg.crops_dir or self.cfg.partial_crops_dir):
-                try:
-                    # Decide which directory to use
-                    if frame_text:
-                        target_dir = self.cfg.high_conf_crops_dir if (self.cfg.high_conf_crops_dir and frame_conf >= self.cfg.high_conf_threshold) else self.cfg.crops_dir
-                    elif frame_partials_current:
-                        target_dir = self.cfg.partial_crops_dir
+                    if formatted:
+                        DIAG.bump("ocr_format_rejected")
                     else:
-                        target_dir = None
-                    
-                    if target_dir:
-                        os.makedirs(target_dir, exist_ok=True)
-                        prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
-                        cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_{winner_alg}.png"), best_plate_img)
+                        DIAG.bump("ocr_empty")
+                    f_text, f_conf = "", 0.0
 
-                    roi = frame_entry.full_frame
-                    if roi is not None and roi.size > 0:
-                        context_img = roi.copy()
-                        ox, oy = frame_entry.roi_offset
-                        px1, py1, px2, py2 = frame_entry.plate_bbox
-                        lx1 = max(0, px1 - ox)
-                        ly1 = max(0, py1 - oy)
-                        lx2 = min(context_img.shape[1], px2 - ox)
-                        ly2 = min(context_img.shape[0], py2 - oy)
-                        cv2.rectangle(context_img, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
-                        
-                        # Comparison Label Overlay
-                        lbl = f"{winner_alg.title()}: {frame_text} ({frame_conf:.2f})" if frame_text else "No Plate Detected"
-                        cv2.putText(context_img, lbl, (lx1, max(18, ly1 - 18)),
-                                    cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
-                        cv2.imwrite(os.path.join(target_dir, f"{prefix}_context.png"), context_img)
-                except Exception as exc:
-                    logger.debug("Failed saving crop image: %s", exc)
+                raw_detections.append((
+                    frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx,
+                    f_text, f_conf,
+                ))
 
-            raw_detections.append((
-                frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx,
-                frame_text, frame_conf,
-            ))
+                # Save enhanced crop and comparison context image
+                if self.cfg.save_crops and (self.cfg.crops_dir or self.cfg.high_conf_crops_dir):
+                    try:
+                        target_dir = self.cfg.high_conf_crops_dir if (
+                            f_text and f_conf >= self.cfg.high_conf_threshold and self.cfg.high_conf_crops_dir
+                        ) else self.cfg.crops_dir
 
-            if frame_text:
-                sharpness_values.append(sharpness)
-                frame_readings.append(
-                    (frame_text, frame_conf, frame_entry.bbox, frame_entry.plate_bbox, frame_entry.frame_idx)
-                )
-                if frame_conf > best_conf:
-                    best_conf = frame_conf
-                    best_text = frame_text
-                    best_bbox = frame_entry.plate_bbox
-            elif frame_partials_current:
-                sharpness_values.append(sharpness)
-                for (p_txt, p_conf, rxmin, rxmax) in frame_partials_current:
-                    frame_partials.append((p_txt, p_conf, rxmin, rxmax, frame_entry.frame_idx))
+                        if target_dir:
+                            os.makedirs(target_dir, exist_ok=True)
+                            prefix = f"track_{job.track_id:03d}_frame_{frame_entry.frame_idx:04d}"
+                            
+                            # Save plate image (and backwards-compatible _plate_bilateral.png)
+                            cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate.png"), plate_crop)
+                            cv2.imwrite(os.path.join(target_dir, f"{prefix}_plate_bilateral.png"), plate_crop)
 
-        if best_text:
+                            roi = frame_entry.full_frame
+                            if roi is not None and roi.size > 0:
+                                context_img = roi.copy()
+                                ox, oy = frame_entry.roi_offset
+                                px1, py1, px2, py2 = frame_entry.plate_bbox
+                                lx1 = max(0, px1 - ox)
+                                ly1 = max(0, py1 - oy)
+                                lx2 = min(context_img.shape[1], px2 - ox)
+                                ly2 = min(context_img.shape[0], py2 - oy)
+                                cv2.rectangle(context_img, (lx1, ly1), (lx2, ly2), (0, 255, 0), 2)
+
+                                lbl = f"TrOCR: {f_text} ({f_conf:.2f})" if f_text else "No Plate Detected"
+                                cv2.putText(context_img, lbl, (lx1, max(18, ly1 - 18)),
+                                            cv2.FONT_HERSHEY_SIMPLEX, 0.45, (0, 255, 0), 1, cv2.LINE_AA)
+                                cv2.imwrite(os.path.join(target_dir, f"{prefix}_context.png"), context_img)
+                    except Exception as exc:
+                        logger.debug("Failed saving crop image: %s", exc)
+
+        if frame_readings:
             status = RecognitionStatus.SUCCESS
-        elif frame_partials:
-            status = RecognitionStatus.PARTIAL_SUCCESS
+            best_entry = max(frame_readings, key=lambda x: x[1])
+            best_text, best_conf, _, best_bbox, _ = best_entry
         else:
             status = RecognitionStatus.NO_PLATE
-            
-        winner = "adaptive" if bilateral_wins < (len(frame_readings) / 2.0) else "bilateral"
-        
+            best_text, best_conf, best_bbox = "", 0.0, None
+
         avg_sharpness = float(sum(sharpness_values) / len(sharpness_values)) if sharpness_values else 0.0
 
         return RecognitionResult(
@@ -378,14 +267,14 @@ class Worker(threading.Thread):
             status                   = status,
             plate_bbox               = best_bbox,
             frame_readings           = tuple(frame_readings),
-            frame_partials           = tuple(frame_partials),
-            frame_readings_bilateral = tuple(readings_bilateral),
+            frame_partials           = (),
+            frame_readings_bilateral = tuple(frame_readings),
             raw_detections           = tuple(raw_detections),
-            winner_branch            = winner,
+            winner_branch            = "trocr",
             avg_sharpness            = avg_sharpness,
         )
 
-    # ── Cropping (no detection — plate_bbox is already known) ─────────────────
+    # ── Cropping ─────────────────────────────────────────────────────────────
 
     @staticmethod
     def _crop_plate(frame_entry) -> Optional[np.ndarray]:
@@ -411,152 +300,15 @@ class Worker(threading.Thread):
 
         return roi[ly1:ly2, lx1:lx2].copy()
 
-    # ── OCR with strict validation & Dual-Pass Whitelisting ────────────────────
-
-    _MIN_PLATE_LEN = 8
-    _MAX_PLATE_LEN = 10
-    _MIN_PARTIAL_LEN = 3
-
-    def _run_ocr_validated(self, plate_img: np.ndarray, tag: str = "") -> Tuple[str, float, List[Tuple[str, float, float, float]]]:
-        """
-        Iterates EasyOCR detections and supports:
-        1. Single-line plate candidate extraction and correction.
-        2. Multi-line / vertically stacked candidate merging (e.g., 2-line Indian plates).
-        3. Dual-pass region split OCR (Left: State+Series, Right: 4-digit registration number).
-        4. Automatic stripping of accidental 'IND' country identifier holograms.
-        5. Soft positional heuristic formatting for Indian vehicle layout.
-        Returns:
-            best_text, best_conf, list of (text, conf, rel_x_min, rel_x_max)
-        """
-        detections = self.ocr.readtext(
-            plate_img,
-            detail          = 1,
-            paragraph       = False,
-            width_ths       = 0.9,
-            contrast_ths    = 0.05,
-            adjust_contrast = 0.6,
-            min_size        = 10,
-            allowlist       = "ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-        )
-
-        plausible: List[Tuple[str, float]] = []
-        partials: List[Tuple[str, float, float, float]] = []
-        raw_seen: List[str] = []
-
-        img_w = max(1, plate_img.shape[1])
-
-        if detections:
-            # 1. Single detection candidates
-            for (_bbox, text, conf) in detections:
-                clean = clean_ocr_text(text)
-                if not clean:
-                    continue
-
-                if clean.startswith("IND") and len(clean) > 10:
-                    clean = clean[3:]
-
-                corrected = soft_format_indian_plate(clean)
-                raw_seen.append(f"'{text}'->'{corrected}'(conf={conf:.2f})")
-
-                if self._MIN_PLATE_LEN <= len(corrected) <= self._MAX_PLATE_LEN:
-                    plausible.append((corrected, float(conf)))
-                elif self._MIN_PARTIAL_LEN <= len(corrected) < self._MIN_PLATE_LEN:
-                    # Calculate relative x position within the plate crop
-                    xs = [p[0] for p in _bbox]
-                    rxmin = max(0.0, min(xs) / img_w)
-                    rxmax = min(1.0, max(xs) / img_w)
-                    partials.append((corrected, float(conf), rxmin, rxmax))
-
-            # 2. Multi-line / vertically stacked detection merging (for 2-line plates)
-            if len(detections) >= 2:
-                sorted_dets = sorted(detections, key=lambda d: min(p[1] for p in d[0]))
-                clean_parts = []
-                confs = []
-                for (_bbox, text, conf) in sorted_dets:
-                    c = clean_ocr_text(text)
-                    if not c or c == "IND":
-                        continue
-                    if c.startswith("IND") and len(c) > 4:
-                        c = c[3:]
-                    clean_parts.append(c)
-                    confs.append(float(conf))
-
-                if len(clean_parts) >= 2:
-                    merged_text = "".join(clean_parts)
-                    if merged_text.startswith("IND") and len(merged_text) > 10:
-                        merged_text = merged_text[3:]
-
-                    corrected_merged = soft_format_indian_plate(merged_text)
-                    merged_conf = float(sum(confs) / len(confs)) if confs else 0.0
-                    raw_seen.append(f"stacked[{'+'.join(clean_parts)}]->'{corrected_merged}'(conf={merged_conf:.2f})")
-
-                    if self._MIN_PLATE_LEN <= len(corrected_merged) <= self._MAX_PLATE_LEN:
-                        plausible.append((corrected_merged, merged_conf))
-
-        # 3. Dual-Pass Region Split (for wide single-line plates)
-        h, w = plate_img.shape[:2]
-        if w / float(max(1, h)) >= 2.2:
-            try:
-                left_crop = plate_img[:, :int(w * 0.58)]
-                right_crop = plate_img[:, int(w * 0.48):]
-
-                left_res = self.ocr.readtext(
-                    left_crop,
-                    detail=1,
-                    paragraph=False,
-                    allowlist="ABCDEFGHIJKLMNOPQRSTUVWXYZ0123456789",
-                )
-                right_res = self.ocr.readtext(
-                    right_crop,
-                    detail=1,
-                    paragraph=False,
-                    allowlist="0123456789",  # Strict numeric for registration digits
-                )
-
-                if left_res and right_res:
-                    l_text = clean_ocr_text("".join(d[1] for d in left_res))
-                    r_text = clean_ocr_text("".join(d[1] for d in right_res))
-                    if l_text.startswith("IND") and len(l_text) > 4:
-                        l_text = l_text[3:]
-
-                    split_combined = l_text + r_text
-                    if self._MIN_PLATE_LEN <= len(split_combined) <= self._MAX_PLATE_LEN:
-                        l_conf = sum(d[2] for d in left_res) / len(left_res)
-                        r_conf = sum(d[2] for d in right_res) / len(right_res)
-                        split_conf = float((l_conf + r_conf) / 2.0)
-                        corrected_split = soft_format_indian_plate(split_combined)
-                        raw_seen.append(f"split[{l_text}+{r_text}]->'{corrected_split}'(conf={split_conf:.2f})")
-                        plausible.append((corrected_split, split_conf))
-            except Exception:
-                pass
-
-        if plausible:
-            DIAG.bump("ocr_forwarded_plausible")
-            best_text, best_conf = max(plausible, key=lambda x: x[1])
-            logger.debug(
-                "OCR forwarded (soft-corrected): '%s' conf=%.3f",
-                best_text, best_conf,
-            )
-            return best_text, best_conf, partials
-
-        if raw_seen:
-            DIAG.bump("ocr_format_rejected")
-            logger.info("OCR true-reject (too short/long) [%s]: %s", tag, "; ".join(raw_seen))
-            _debug_save("ocr_format_rejected", plate_img, tag=tag)
-        else:
-            DIAG.bump("ocr_empty")
-            _debug_save("ocr_empty", plate_img, tag=tag)
-        return "", 0.0, partials
-
 
 class WorkerPoolStage:
 
     def __init__(self, job_q: Queue, result_q: Queue,
-                 num_workers: int = config.NUM_WORKERS, config: WorkerConfig = None):
+                 num_workers: int = config.NUM_WORKERS, config: WorkerConfig = None, config_obj: WorkerConfig = None):
         self.job_q    = job_q
         self.result_q = result_q
-        cfg           = config or WorkerConfig()
-        self.workers  = [Worker(job_q, result_q, cfg) for _ in range(num_workers)]
+        cfg           = config or config_obj or WorkerConfig()
+        self.workers  = [Worker(job_q, result_q, config=cfg) for _ in range(num_workers)]
 
     def start(self) -> None:
         for w in self.workers:
@@ -567,5 +319,5 @@ class WorkerPoolStage:
             self.job_q.put(None)
         for w in self.workers:
             w.join()
-        logger.info("All workers shut down cleanly.")
+        logger.info("All TrOCR workers shut down cleanly.")
         logger.info(DIAG.report())

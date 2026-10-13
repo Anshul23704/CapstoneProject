@@ -20,16 +20,29 @@ class TrOCRInferenceEngine:
       - Image file paths (strings)
     """
     def __init__(self, model_path="model_checkpoint", device=None, use_fp16=True):
-        self.device = device if device else torch.device("cuda" if torch.cuda.is_available() else "cpu")
+        if device is not None:
+            self.device = torch.device(device) if isinstance(device, str) else device
+        elif torch.cuda.is_available():
+            self.device = torch.device("cuda")
+        elif hasattr(torch.backends, "mps") and torch.backends.mps.is_available():
+            self.device = torch.device("mps")
+        else:
+            self.device = torch.device("cpu")
+
         self.tokenizer = CharacterTokenizer()
-        self.image_processor = ViTImageProcessor.from_pretrained("microsoft/trocr-small-printed")
         
         if not os.path.exists(model_path):
             raise FileNotFoundError(f"TrOCR checkpoint directory not found at: {model_path}")
+
+        # Prefer local preprocessor config for 100% offline execution
+        if os.path.exists(os.path.join(model_path, "preprocessor_config.json")):
+            self.image_processor = ViTImageProcessor.from_pretrained(model_path)
+        else:
+            self.image_processor = ViTImageProcessor.from_pretrained("microsoft/trocr-small-printed")
             
         self.model = VisionEncoderDecoderModel.from_pretrained(model_path)
         
-        # Enable FP16 for ~2x GPU inference acceleration and 50% VRAM reduction
+        # Enable FP16 for ~2x GPU inference acceleration and 50% VRAM reduction (CUDA only)
         self.use_fp16 = use_fp16 and self.device.type == "cuda"
         if self.use_fp16:
             self.model.half()

@@ -6,3 +6,8 @@ matplotlib
 ultralytics
 supervision
 easyocr
+torch>=2.0.0
+torchvision>=0.15.0
+transformers>=4.30.0
+safetensors>=0.3.0
+pillow>=9.0.0
