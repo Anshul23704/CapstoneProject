@@ -106,11 +106,13 @@ def _result_consumer(
                 readings_for_fusion = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings]
                 fused_text, fused_conf, is_valid = fusion.process(readings_for_fusion)
 
-                if result.frame_readings_bilateral:
+                if getattr(result, "frame_readings_bilateral", None):
                     r_b = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_bilateral]
                     fused_b, conf_b, _ = fusion.process(r_b)
+                else:
+                    fused_b, conf_b = fused_text, fused_conf
 
-                if result.frame_readings_adaptive:
+                if getattr(result, "frame_readings_adaptive", None):
                     r_a = [(t, c) for (t, c, _vb, _pb, _fi) in result.frame_readings_adaptive]
                     fused_a, conf_a, _ = fusion.process(r_a)
 
@@ -461,6 +463,8 @@ def run() -> None:
             total_frames=total_frames,
             fps=fps
         )
+    except ImportError:
+        pass
     except Exception:
         logger.exception("Failed to generate research metrics")
 

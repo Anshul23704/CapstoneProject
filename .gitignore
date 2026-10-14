@@ -1,35 +1,100 @@
-# Large/generated folders
-input/
-output/
-models/
-debug_plate_crops/
-dataset/
+# ==============================================================================
+# .gitignore — Automated License Plate Recognition (ALPR) Pipeline
+# ==============================================================================
 
-# Virtual Environment
+# ── Datasets & Video Footage (Teammates configure their own inputs) ───────────
+dataset/
+input/
+footage/
+*.mp4
+*.MP4
+*.avi
+*.mov
+*.mkv
+
+# ── Pipeline Outputs & Generated Artifacts ────────────────────────────────────
+output/
+debug_plate_crops/
+plate_crops/
+runs/
+*.db
+*.sqlite
+*.sqlite3
+*.csv
+*.parquet
+*.feather
+
+# ── Model Weights & Pre-trained Detectors ─────────────────────────────────────
+# (Teammates download YOLO vehicle and plate detector weights locally)
+models/
+*.pt
+*.pth
+*.onnx
+*.engine
+*.tflite
+*.weights
+*.bin
+
+# ── Git LFS / Checkpoints Exception ───────────────────────────────────────────
+# TrOCR model checkpoint is tracked via Git LFS (.gitattributes)
+!model_checkpoint/
+!model_checkpoint/*
+
+# ── Large Archives & Compressed Packages ──────────────────────────────────────
+*.zip
+*.tar
+*.tar.gz
+*.tgz
+*.rar
+*.7z
+
+# ── Python Virtual Environments ───────────────────────────────────────────────
 .venv/
 venv/
 env/
 ENV/
+env.bak/
+venv.bak/
 
-# Python cache & bytecode
+# ── Python Bytecode & Cache ───────────────────────────────────────────────────
 __pycache__/
 *.py[cod]
 *$py.class
+*.so
+.pytest_cache/
+.coverage
+htmlcov/
+build/
+dist/
+*.egg-info/
 
-# Model weights
-*.pt
-*.onnx
-*.engine
-
-# OS & Editor files
+# ── OS & Local IDE Configurations ─────────────────────────────────────────────
 .DS_Store
+.DS_Store?
+._*
+.Spotlight-V100
+.Trashes
+ehthumbs.db
+Thumbs.db
 .vscode/
+!.vscode/settings.json
+.idea/
+*.swp
+*.swo
+*~
 tempCodeRunnerFile.py
-# Large archives
-*.zip
 
-# Markdown files
-*.md
-!OCR_Model_Training_Context.md
-!README.md
-!CustomOCRDetails.md
+# ── Environment Secrets & Local Overrides ─────────────────────────────────────
+.env
+.env.local
+.env.*.local
+!.env.example
+!GUI/.env.example
+
+# ── Logs & Temporary Files ────────────────────────────────────────────────────
+*.log
+*.tmp
+*.bak
+
+# ── Internal Working Drafts & Notes ───────────────────────────────────────────
+MD files/

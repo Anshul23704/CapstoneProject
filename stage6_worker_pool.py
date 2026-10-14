@@ -19,7 +19,8 @@ from typing import List, Optional, Tuple
 import cv2
 import numpy as np
 
-import config
+import config as app_config
+config = app_config
 from ocr_engine.trocr_engine import TrOCRInferenceEngine
 from plate_utils import (
     clean_ocr_text,
@@ -89,6 +90,7 @@ class RecognitionResult:
     frame_readings:           tuple = ()
     frame_partials:           tuple = ()
     frame_readings_bilateral: tuple = ()
+    frame_readings_adaptive:  tuple = ()
     # Raw bounding boxes for Stage 10 video rendering
     raw_detections:           tuple = ()
     winner_branch:            str = "trocr"
@@ -119,10 +121,10 @@ class Worker(threading.Thread):
         self.cfg      = config or config_obj or WorkerConfig()
 
         logger.info("Worker init: loading TrOCR engine (model=%s, device=%s)",
-                    self.cfg.trocr_model_path, config.DEVICE if hasattr(config, "DEVICE") else "auto")
+                    self.cfg.trocr_model_path, app_config.DEVICE)
         self.engine = TrOCRInferenceEngine(
             model_path=self.cfg.trocr_model_path,
-            device=config.DEVICE,
+            device=app_config.DEVICE,
             use_fp16=True,
         )
 
@@ -269,6 +271,7 @@ class Worker(threading.Thread):
             frame_readings           = tuple(frame_readings),
             frame_partials           = (),
             frame_readings_bilateral = tuple(frame_readings),
+            frame_readings_adaptive  = (),
             raw_detections           = tuple(raw_detections),
             winner_branch            = "trocr",
             avg_sharpness            = avg_sharpness,
